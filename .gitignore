@@ -149,3 +149,22 @@ __pycache__
 *ckpt
 *pt
 *lightning_logs*
+
+# W&B
+wandb/
+
+# Data files (large)
+/data/DreaMS-Atlas/
+*.hdf5
+*.btr
+
+# Core dumps
+core
+
+# Job submissions & logs
+/job_submissions/
+*.err
+*.out
+
+# Experiments outputs
+/experiments/
