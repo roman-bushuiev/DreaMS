@@ -95,7 +95,7 @@ class MultiheadAttention(nn.Module):
             att_weights = att_weights + att_bias
 
         if mask is not None:
-            att_weights.masked_fill_(mask.unsqueeze(1).unsqueeze(-1), -1e9)
+            att_weights.masked_fill_(mask.unsqueeze(1).unsqueeze(2), -1e9)
 
         att_weights = F.softmax(att_weights, dim=-1)
         att_weights = F.dropout(att_weights, p=self.dropout, training=self.training)
