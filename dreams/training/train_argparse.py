@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument('--n_pos_samples', type=int, default=1)
     parser.add_argument('--n_neg_samples', type=int, default=1)
     parser.add_argument('--triplet_loss_margin', type=float, default=0.2)
+    parser.add_argument('--df_smiles_similarities', type=Path, default=None)
 
     # Model (general)
     parser.add_argument('--model', type=str, default='DreaMS', choices=['DreaMS', 'VanillaBERT', 'DeepSets'])

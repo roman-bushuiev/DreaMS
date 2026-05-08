@@ -1421,12 +1421,13 @@ class MatchmsSpectraDataset(Dataset):
 class ContrastiveSpectraDataset(Dataset):
     def __init__(self, df: pd.DataFrame, spec_preproc: SpectrumPreprocessor,
                  msn_spec_col='MSnSpectrum', pos_idx_col='pos_idx', neg_idx_col='neg_idx',
-                 n_pos_samples=1, n_neg_samples=10, return_smiles=False, logger=None):
+                 n_pos_samples=1, n_neg_samples=10, return_smiles=False, smiles_col='SMILES', logger=None):
         self.df = df
         self.spec_preproc = spec_preproc
         self.msn_spec_col = msn_spec_col
         self.pos_idx_col = pos_idx_col
         self.neg_idx_col = neg_idx_col
+        self.smiles_col = smiles_col
         self.n_pos_samples = n_pos_samples
         self.n_neg_samples = n_neg_samples
         self.return_smiles = return_smiles
@@ -1439,10 +1440,10 @@ class ContrastiveSpectraDataset(Dataset):
         spec = self.df[self.msn_spec_col].loc[i]
         pos_idx = self.df[self.pos_idx_col].loc[i]
         neg_idx = self.df[self.neg_idx_col].loc[i]
-
+        smiles = self.df[self.smiles_col].loc[i]
         item = {'spec': self.spec_preproc(spec.get_peak_list(), prec_mz=spec.get_precursor_mz(), high_form=False)}
         if self.return_smiles:
-            item['smiles'] = Chem.MolToSmiles(spec.get_precursor_mol())
+            item['smiles'] = smiles
 
         # Sample positive and negative spectra
         for k, idx, n_samples in [('pos', pos_idx, self.n_pos_samples), ('neg', neg_idx, self.n_neg_samples)]:
@@ -1454,7 +1455,7 @@ class ContrastiveSpectraDataset(Dataset):
             item[f'{k}_specs'] = np.stack(specs)
 
             if self.return_smiles:
-                item[f'{k}_smiles'] = [Chem.MolToSmiles(self.df['ROMol'].loc[i]) for i in idx]
+                item[f'{k}_smiles'] = [self.df[self.smiles_col].loc[i] for i in idx]
 
         return item
 

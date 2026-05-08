@@ -726,7 +726,7 @@ class FingerprintHead(FineTuningHead):
 
 
 class ContrastiveHead(FineTuningHead):
-    def __init__(self, backbone_pth: Path, lr, weight_decay, triplet_loss_margin: float):
+    def __init__(self, backbone_pth: Path, lr, weight_decay, triplet_loss_margin: float, df_smiles_similarities: pd.DataFrame = None):
         """
         Initialize the ContrastiveHead.
 
@@ -741,8 +741,11 @@ class ContrastiveHead(FineTuningHead):
 
         # Metrics for similarity correlation
         self.triplet_loss_margin = triplet_loss_margin
+        self.df_smiles_similarities = df_smiles_similarities
+        if self.df_smiles_similarities is not None:
+            self.df_smiles_similarities = pd.read_pickle(self.df_smiles_similarities).set_index(['SMILES 1', 'SMILES 2'])  # gt pairwise similarities
 
-    def step(self, data, batch_idx):
+    def step(self, data, batch_idx, metric_pref='', only_loss=True):
         """
         Perform a single step of computation.
 
@@ -789,14 +792,71 @@ class ContrastiveHead(FineTuningHead):
         loss = torch.clamp_min(self.triplet_loss_margin + (-cos_sim_pos) - (-cos_sim_neg), 0)
         loss = loss.mean()
 
+        if not only_loss:
+
+            # Evaluate retrieval with respect to positive and negative neighbors
+            # AUROC
+            cos_sim = torch.cat([cos_sim_pos, cos_sim_neg], dim=-1)
+            retrieval_labels = torch.cat([torch.ones_like(cos_sim_pos), torch.zeros_like(cos_sim_neg)], dim=-1)
+            cos_sim = cos_sim.flatten()
+            retrieval_labels = retrieval_labels.flatten()
+            self._update_metric(
+                f'{metric_pref}retrieval_auroc',
+                BinaryAUROC,
+                (cos_sim, retrieval_labels),
+                retrieval_labels.size(0),
+                log_n_samples=True
+            )
+            # ROC
+            self._update_metric(
+                f'{metric_pref}roc',
+                BinaryROC,
+                (cos_sim, retrieval_labels.long()),
+                retrieval_labels.size(0),
+                log=False
+            )
+            # PR curve  
+            self._update_metric(
+                f'{metric_pref}pr_curve',
+                BinaryPrecisionRecallCurve,
+                (cos_sim, retrieval_labels.long()),
+                retrieval_labels.size(0),
+                log=False
+            )
+
+            # Evaluate correlation with gt similarities
+            if self.df_smiles_similarities is not None:
+                sim_true, sim_pred = [], []
+                for i, (s1, z1) in enumerate(zip(data['smiles'], emb)):
+                    for j, (s2, z2) in enumerate(zip(data['smiles'], emb)):
+                        if i < j:
+                            if s1 != s2:
+                                if (s1, s2) in self.df_smiles_similarities.index:
+                                    sim_true.append(self.df_smiles_similarities.loc[(s1, s2)].values[0])
+                                elif (s2, s1) in self.df_smiles_similarities.index:
+                                    sim_true.append(self.df_smiles_similarities.loc[(s2, s1)].values[0])
+                                else:
+                                    raise KeyError(f'KeyError in pre-computed df_smiles_similarities: {s1}, {s2}')
+                            else:
+                                sim_true.append(1.0)
+                            sim_pred.append(F.cosine_similarity(z1, z2, dim=-1).item())
+                sim_true, sim_pred = torch.tensor(sim_true).to(self.device), torch.tensor(sim_pred).to(self.device)
+                self._update_metric(
+                    f'{metric_pref}similarity_pearson',
+                    PearsonCorrCoef,
+                    (sim_pred, sim_true),
+                    sim_true.size(0),
+                    log_n_samples=True
+                )
+
         return None, loss
 
     def training_step(self, data, batch_idx):
-        _, loss = self.step(data, batch_idx)
+        _, loss = self.step(data, batch_idx, only_loss=True)
         self.log('Train loss', loss, sync_dist=True)
         return loss
 
     def validation_step(self, data, batch_idx, dataloader_idx=0):
-        _, loss = self.step(data, batch_idx)
+        _, loss = self.step(data, batch_idx, only_loss=False)
         self.log('Val loss', loss, sync_dist=True)
         return loss

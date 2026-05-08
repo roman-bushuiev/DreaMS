@@ -222,7 +222,8 @@ def main(args):
             elif args.train_objective == 'contrastive_spec_embs':
                 # df_smiles_similarities = pd.read_pickle(MERGED_DATASETS / 'nist20_clean_MoNA_contrastive_v2_10ppm_smiles_similarities_asymmetric.pkl')#io.append_to_stem(args.dataset_pth, f'smiles_similarities'))
                 model = ContrastiveHead(args.pre_trained_pth, args.lr, args.weight_decay,
-                                        triplet_loss_margin=args.triplet_loss_margin)
+                                        triplet_loss_margin=args.triplet_loss_margin,
+                                        df_smiles_similarities=args.df_smiles_similarities)
             elif args.train_objective == 'mol_props':
                 mol_props_calc = dataset.prop_calc
                 model = RegressionHead(backbone, args.lr, args.weight_decay, sigmoid=False, out_dim=len(mol_props_calc),
@@ -276,7 +277,13 @@ def main(args):
                     )
 
         # Define trainer
+        # Use gloo on AMD GPUs (LUMI MI250X): rccl/nccl hangs on large BROADCAST/AllReduce collectives.
+        # DreaMS-Mol uses the same detection pattern.
+        import torch as _torch
+        _gpu_name = _torch.cuda.get_device_name(0).lower() if _torch.cuda.is_available() else ""
+        _pg_backend = "gloo" if "amd" in _gpu_name or "instinct" in _gpu_name else "nccl"
         strategy = pl.strategies.DDPStrategy(
+            process_group_backend=_pg_backend,
             find_unused_parameters=False if args.train_regime == 'pre-training' else True
         ) if not cv else None
         trainer = pl.Trainer(
@@ -296,11 +303,13 @@ def main(args):
                     'num_params': sum(p.numel() for p in model.parameters() if p.requires_grad)
             })
 
-        # Compute validation metrics before the training
+        # Compute validation metrics before the training (pre-training only).
+        # For fine-tuning we go straight to fit(); validation runs inside it via val_check_interval.
+        # Running trainer.validate() + trainer.fit() in sequence initialises and tears down the
+        # RCCL/NCCL process group twice, which causes a 30-min BROADCAST hang on LUMI AMD GPUs.
         if args.train_regime == 'pre-training' and not args.no_val:
             trainer.validate(model, data_module)
-
-        trainer.validate(model, dataloaders=[l for l in [data_module.val_dataloader()] if l is not None])
+            trainer.validate(model, dataloaders=[l for l in [data_module.val_dataloader()] if l is not None])
 
         trainer.fit(model, train_dataloaders=data_module.train_dataloader(),
                     val_dataloaders=[l for l in [data_module.val_dataloader()] if l is not None])
