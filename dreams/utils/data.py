@@ -175,6 +175,8 @@ def load_hdf5_in_mem(dct):
 
 
 class MSData:
+    DEFAULT_METADATA_FK = 'file_id'
+
     def __init__(
             self,
             hdf5_pth: Union[Path, str, List[Path]],
@@ -182,7 +184,9 @@ class MSData:
             mode: str = 'r',
             spec_col: str = SPECTRUM,
             prec_mz_col: str = PRECURSOR_MZ,
-            index_col: Optional[str] = None
+            index_col: Optional[str] = None,
+            metadata_group: Optional[str] = None,
+            metadata_fk: Optional[str] = None,
         ):
         if isinstance(hdf5_pth, list):
             self.f = io.ChunkedHDF5File(hdf5_pth)
@@ -199,8 +203,13 @@ class MSData:
             raise ValueError('Shape of spectra has to be (num_spectra, 2 (m/z, intensity), num_peaks).')
 
         num_spectra = set()
+        self._group_keys = set()
         for k in self.f.keys():
-            num_spectra.add(self.f[k].shape[0])
+            item = self.f[k]
+            if isinstance(item, h5py.Group):
+                self._group_keys.add(k)
+                continue
+            num_spectra.add(item.shape[0])
         if len(num_spectra) != 1:
             raise ValueError(f'Columns in {hdf5_pth} have different number of entries.')
 
@@ -209,10 +218,34 @@ class MSData:
         self.data = self.f
         self.mode = mode
 
+        self.metadata_group_name = metadata_group
+        self.metadata_fk = metadata_fk if metadata_group is not None else None
+        self.num_metadata_rows = 0
+        self.metadata_data = None
+        if metadata_group is not None:
+            if self.metadata_fk is None:
+                self.metadata_fk = self.DEFAULT_METADATA_FK
+            if metadata_group not in self.f.keys() or not isinstance(self.f[metadata_group], h5py.Group):
+                raise ValueError(f'Metadata group "{metadata_group}" not found at root of {hdf5_pth}.')
+            grp = self.f[metadata_group]
+            lengths = {grp[k].shape[0] for k in grp.keys()}
+            if len(lengths) != 1:
+                raise ValueError(f'Metadata group "{metadata_group}" has inconsistent column lengths: {lengths}.')
+            self.num_metadata_rows = lengths.pop()
+            if self.metadata_fk not in self.f.keys() or isinstance(self.f[self.metadata_fk], h5py.Group):
+                raise ValueError(f'Metadata FK column "{self.metadata_fk}" not found at root of {hdf5_pth}.')
+            if not np.issubdtype(self.f[self.metadata_fk].dtype, np.integer):
+                raise ValueError(f'Metadata FK column "{self.metadata_fk}" must be integer dtype, got {self.f[self.metadata_fk].dtype}.')
+            if self.f[self.metadata_fk].shape != (self.num_spectra,):
+                raise ValueError(f'Metadata FK column "{self.metadata_fk}" shape {self.f[self.metadata_fk].shape} != (num_spectra={self.num_spectra},).')
+            self.metadata_data = self.f[metadata_group]
+
         if in_mem:
             print(f'Loading dataset {self.hdf5_pth.stem} into memory ({self.num_spectra} {"spectra" if self.num_spectra > 1 else "spectrum"})...')
             self.data = self.load_hdf5_in_mem(self.f)
-        
+            if metadata_group is not None:
+                self.metadata_data = self.data[metadata_group]
+
         self.index_col = index_col
         self.index_to_i = None
         if index_col is not None:
@@ -225,7 +258,40 @@ class MSData:
             return
 
     def columns(self):
-        return list(self.data.keys())
+        return [c for c in self.data.keys() if c not in self._group_keys]
+
+    def metadata_columns(self):
+        if self.metadata_data is None:
+            return []
+        return list(self.metadata_data.keys())
+
+    def get_metadata(self, col, spec_idx=None, decode_strings=True):
+        if self.metadata_data is None:
+            raise ValueError('No metadata_group configured for this MSData instance.')
+        raw = self.metadata_data[col]
+        if spec_idx is None:
+            out = raw[:]
+        else:
+            fk = self.data[self.metadata_fk] if self.in_mem else self.f[self.metadata_fk]
+            if isinstance(spec_idx, (int, np.integer)):
+                rows = int(fk[int(spec_idx)])
+                out = raw[rows]
+            else:
+                fk_arr = np.asarray(fk[:])
+                rows = fk_arr[spec_idx]
+                out = np.asarray(raw[:])[rows]
+        if decode_strings:
+            if isinstance(out, bytes):
+                out = out.decode('utf-8')
+            elif hasattr(out, 'dtype') and out.dtype == object:
+                out = np.array([s.decode('utf-8') if isinstance(s, bytes) else s for s in out])
+        return out
+
+    def metadata_at(self, spec_idx, decode_strings=True):
+        if self.metadata_data is None:
+            return {}
+        return {k: self.get_metadata(k, spec_idx=spec_idx, decode_strings=decode_strings)
+                for k in self.metadata_columns()}
 
     def load_col_in_mem(self, col):
         if isinstance(col, h5py.Group):
@@ -408,17 +474,23 @@ class MSData:
         else:
             return RawSpectraDataset(self.get_spectra(), self.get_prec_mzs(), spec_preproc, **kwargs)
 
-    def to_pandas(self, unpad=True, ignore_cols=(DREAMS_EMBEDDING,)):
+    def to_pandas(self, unpad=True, ignore_cols=(DREAMS_EMBEDDING,), include_metadata=False):
         df = {col: self.get_values(col) for col in self.columns() if col not in ignore_cols}
 
         if SPECTRUM not in ignore_cols:
             df[SPECTRUM] = list(self.get_spectra())
             if unpad:
                 df[SPECTRUM] = [su.unpad_peak_list(s) for s in df[SPECTRUM]]
-            
+
             df[SPECTRUM] = [s.tolist() for s in df[SPECTRUM]]
 
-        return pd.DataFrame(df)
+        out = pd.DataFrame(df)
+        if include_metadata and self.metadata_data is not None:
+            prefix = self.metadata_group_name
+            spec_idx = np.arange(len(self))
+            for k in self.metadata_columns():
+                out[f'{prefix}.{k}'] = self.get_metadata(k, spec_idx=spec_idx)
+        return out
     
     def to_mgf(self, out_pth: Union[Path, str]):
         import unicodedata
@@ -488,6 +560,14 @@ class MSData:
                 del res[SPECTRUM]
             elif unpad_spec:
                 res[SPECTRUM] = su.unpad_peak_list(res[SPECTRUM])
+
+        if self.metadata_data is not None:
+            prefix = self.metadata_group_name
+            for k, v in self.metadata_at(i).items():
+                key = f'{prefix}.{k}'
+                if vals is not None and key not in vals:
+                    continue
+                res[key] = process_val(v) if not isinstance(v, np.ndarray) else v
 
         return res
 
