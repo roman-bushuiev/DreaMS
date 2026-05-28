@@ -3,6 +3,7 @@ import sys
 import pickle
 import json
 import os
+import subprocess
 import h5py
 import click
 import re
@@ -587,6 +588,24 @@ def extract_ce(path):
         elem.clear()
     return out
 
+@cache
+def _dreams_io_version() -> str:
+    """Short git SHA of the DreaMS repo (best-effort; 'unknown' off-git).
+
+    Stored as an HDF5 root attr so a parse can be attributed to a pipeline
+    version and re-parsing can be skipped when the version matches (resume).
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parent),
+             "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        )
+        return out.decode("utf-8").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def read_mzml(
     pth: Union[Path, str],
     output_path: Optional[Union[Path, str]] = None,
@@ -598,6 +617,13 @@ def read_mzml(
     only_format: Optional[str] = None,
     log_path: Optional[Union[Path, str]] = None,
     logger=None,
+    compute_features: bool = False,
+    sirius_workdir: Optional[Union[Path, str]] = None,
+    sirius_port: Optional[int] = None,
+    sirius_tol_mz_ppm: Optional[float] = None,
+    sirius_tol_rt_s: float = 5.0,
+    sirius_workspace: Optional[Union[Path, str]] = None,
+    sirius_rest_url: Optional[str] = None,
 ):
     """
     Read MS2 spectra from an .mzML or .mzXML file into a DataFrame, and optionally
@@ -661,6 +687,17 @@ def read_mzml(
 
         tbxic_stdev = instrument_props.get('TBXICs median stdev')
         instrument_name = instrument_props.get('instrument name')
+
+        # Instrument-family + acquisition-mode metadata (always computed, not
+        # only when compute_features=True). Lands in HDF5 root attrs → /metadata.
+        _family = lcms.classify_instrument_family(instrument_name)
+        _mode, _dia_w = lcms.detect_acquisition_mode(pth, return_diagnostics=True)
+        _auto_ppm = lcms.INSTRUMENT_FAMILIES[_family]['ppm_default']
+        file_props['instrument_family'] = _family
+        file_props['acquisition_mode'] = _mode.value
+        file_props['auto_tol_mz_ppm'] = float(_auto_ppm) if _auto_ppm is not None else -1.0
+        file_props['dia_window_width_da'] = float(_dia_w) if _dia_w == _dia_w else -1.0
+        file_props['dreams_io_version'] = _dreams_io_version()
 
     df = []
     automatic_scans_message = False
@@ -808,7 +845,8 @@ def read_mzml(
                 'precursor_target_intensity': prec_target_intensity,
                 'instrument_name': instrument_name,
                 'tbxic_stdev' : tbxic_stdev,
-                'collision_energy' : collision_energy
+                'collision_energy' : collision_energy,
+                'activation_mode': lcms.activation_modes_from_precursor(prec),
             })
 
             if assign_dformats:
@@ -831,6 +869,26 @@ def read_mzml(
     if store_extra:
         if len(df) > 0 and tbxic_stdev is not None:
             df['instrument_accuracy_est'] = tbxic_stdev
+        # Normalized collision energy (eV / NCE estimates + unit) per spectrum,
+        # using the file-level instrument family. Lossless: raw collision_energy
+        # is kept; these are best-effort cross-instrument-comparable estimates.
+        if len(df) > 0:
+            _fam = file_props.get('instrument_family', 'unknown')
+            norm = [
+                lcms.normalize_collision_energy(ce, pmz, ch, _fam)
+                for ce, pmz, ch in zip(
+                    df['collision_energy'], df[PRECURSOR_MZ], df[CHARGE])
+            ]
+            df['collision_energy_ev_est'] = [x[0] for x in norm]
+            df['collision_energy_nce_est'] = [x[1] for x in norm]
+            df['collision_energy_unit'] = [x[2] for x in norm]
+        # Lightweight parse-log counters (one value per file → tiny in /metadata).
+        file_props['n_ms1_spectra'] = int(ms1_n)
+        file_props['n_msn_collected'] = int(len(df))
+        if file_props.get('instrument_family') == 'unknown' and instrument_name:
+            logger.warning(
+                f"Unclassified instrument '{instrument_name}' "
+                f"(family=unknown) for {pth.name}")
         logger.info(f'File properties: {json.dumps(file_props)}')
         logger.info(f'Num. of MS1 spectra: {ms1_n}')
         logger.info(f'Collected {len(df)} from {msn_n} total num. of MSn spectra')
@@ -864,6 +922,77 @@ def read_mzml(
             logger=logger,
         )
 
+        # Optional: run SIRIUS lcms-align and attach a /features group + root
+        # /feature_id FK column to the just-written HDF5. Failures are logged
+        # but do NOT invalidate the MS2-only HDF5 — downstream code can simply
+        # use it as if compute_features=False.
+        if compute_features:
+            try:
+                from dreams.utils.lcms import (
+                    compute_features_for_mzml, compute_features_via_rest,
+                    attach_features_group, link_ms2_to_features,
+                )
+                _sirius_workdir = (
+                    Path(sirius_workdir) if sirius_workdir is not None
+                    else Path(output_path).parent / "sirius_work"
+                )
+                _sirius_workdir.mkdir(parents=True, exist_ok=True)
+                if sirius_rest_url:
+                    # Persistent-server path: all SIRIUS work runs inside one
+                    # already-authenticated server over HTTP (no per-file auth).
+                    feats_df, isotope_patterns, attrs, status = compute_features_via_rest(
+                        pth, sirius_rest_url, _sirius_workdir,
+                    )
+                else:
+                    feats_df, isotope_patterns, attrs, status = compute_features_for_mzml(
+                        pth, _sirius_workdir,
+                        sirius_port=sirius_port,
+                        keep_project=False,
+                        sirius_workspace=sirius_workspace,
+                    )
+                # Auto-resolve ppm tolerance from instrument family if caller
+                # didn't override. attrs["auto_tol_mz_ppm"] is filled by
+                # compute_features_for_mzml from the mzML's instrument string.
+                resolved_tol_ppm = (
+                    sirius_tol_mz_ppm if sirius_tol_mz_ppm is not None
+                    else float(attrs.get("auto_tol_mz_ppm", 20.0))
+                )
+                attrs["link_tol_mz_ppm"] = resolved_tol_ppm
+                attrs["link_tol_rt_s"] = sirius_tol_rt_s
+                # Pull precursor_mz / RT from the freshly-written HDF5 so the
+                # linkage always reflects what landed on disk.
+                with h5py.File(str(output_path), "r") as hf:
+                    prec_mz = hf[PRECURSOR_MZ][:]
+                    rt_s = hf[RT][:]
+                fids = link_ms2_to_features(
+                    prec_mz, rt_s, feats_df,
+                    tol_mz_ppm=resolved_tol_ppm,
+                    tol_rt_s=sirius_tol_rt_s,
+                )
+                # Record feature-detection status in the group attrs so the
+                # HDF5 is self-describing (benchmark / validation read it back).
+                attrs["features_status"] = "ok" if status.get("ok") else "skip"
+                attrs["features_skip_reason"] = status.get("skip_reason", "")
+                attach_features_group(
+                    output_path, feats_df, isotope_patterns, fids, attrs=attrs,
+                )
+                if logger:
+                    logger.info(
+                        f"Attached /features group: n_features={len(feats_df)}, "
+                        f"n_ms2_linked={int((fids >= 0).sum())}/{len(fids)} "
+                        f"(instrument={attrs.get('instrument_family')}, "
+                        f"tol_ppm={resolved_tol_ppm}, status={status})"
+                    )
+            except Exception as e:
+                # SIRIUS failures must not corrupt the MS2-only HDF5.
+                import traceback
+                tb = traceback.format_exc()
+                if logger:
+                    logger.error(f"SIRIUS feature attachment failed: {e}\n{tb}")
+                else:
+                    sys.stderr.write(
+                        f"SIRIUS feature attachment failed for {pth}: {e}\n{tb}\n")
+
     return df
 
 
@@ -893,6 +1022,11 @@ def _write_flat_hdf5(
         compress_full_lvl: gzip compression level for metadata datasets.
         logger: Optional logger.
     """
+    # HDF5 file locking is unreliable on the Lustre parallel filesystem and
+    # raises "can't retrieve stat info for file" on create. Disable it here so
+    # the writer is robust regardless of whether the caller already set it.
+    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
     # Process peak lists: trim/pad to n_highest_peaks
     df = df.fillna(-1)
     peak_lists = list(df[SPECTRUM].values)
@@ -965,6 +1099,26 @@ def _write_flat_hdf5(
                                         compression=compress_full_lvl)
                 hdf_file.create_dataset('collision_energy', data=df['collision_energy'], dtype='f4',
                                         compression=compress_full_lvl)
+                # Normalized collision energy (best-effort cross-instrument).
+                if 'collision_energy_ev_est' in df.columns:
+                    hdf_file.create_dataset('collision_energy_ev_est',
+                                            data=df['collision_energy_ev_est'], dtype='f4',
+                                            compression=compress_full_lvl)
+                    hdf_file.create_dataset('collision_energy_nce_est',
+                                            data=df['collision_energy_nce_est'], dtype='f4',
+                                            compression=compress_full_lvl)
+                    hdf_file.create_dataset(
+                        'collision_energy_unit',
+                        data=np.asarray(df['collision_energy_unit'].astype(str).tolist(),
+                                        dtype=h5py.string_dtype('utf-8', 8)),
+                        compression=compress_full_lvl)
+                # Fragmentation/activation mode (MassBank CV: HCD/CID/ETD/...).
+                if 'activation_mode' in df.columns:
+                    hdf_file.create_dataset(
+                        'activation_mode',
+                        data=np.asarray(df['activation_mode'].astype(str).tolist(),
+                                        dtype=h5py.string_dtype('utf-8', 16)),
+                        compression=compress_full_lvl)
                 hdf_file.create_dataset('precursor intensity', data=df['precursor_intensity'], dtype='f4',
                                         compression=compress_full_lvl)
                 hdf_file.create_dataset('precursor target intensity', data=df['precursor_target_intensity'],
@@ -1550,8 +1704,14 @@ def merge_lcmsms_hdf5s(
     }
     metadata_fields = [
         '#TBXICs', '#TBXICs(1)', 'MSLevelOrder', 'Ordered RT',
-        'TBXICs mean stdev', 'TBXICs median stdev', 'instrument name', 'name'
+        'TBXICs mean stdev', 'TBXICs median stdev', 'instrument name', 'name',
+        # Phase B+ file-level metadata (set in read_mzml when store_extra=True)
+        'instrument_family', 'acquisition_mode', 'auto_tol_mz_ppm',
+        'dia_window_width_da', 'dreams_io_version',
+        'n_ms1_spectra', 'n_msn_collected',
     ]
+    _float_metadata_fields = {'auto_tol_mz_ppm', 'dia_window_width_da'}
+    _int_metadata_fields = {'n_ms1_spectra', 'n_msn_collected'}
 
     def _normalize_attr(val):
         if isinstance(val, bytes):
@@ -1573,6 +1733,10 @@ def merge_lcmsms_hdf5s(
                 return -1
             if field in {'TBXICs mean stdev', 'TBXICs median stdev'}:
                 return np.nan
+            if field in _float_metadata_fields:
+                return np.nan
+            if field in _int_metadata_fields:
+                return -1
             return ''
 
         value = _normalize_attr(value)
@@ -1588,6 +1752,16 @@ def merge_lcmsms_hdf5s(
                 return float(value)
             except Exception:
                 return np.nan
+        if field in _float_metadata_fields:
+            try:
+                return float(value)
+            except Exception:
+                return np.nan
+        if field in _int_metadata_fields:
+            try:
+                return int(value)
+            except Exception:
+                return -1
         return str(value)
 
     def _fill_array(shape, dtype):
@@ -1654,7 +1828,15 @@ def merge_lcmsms_hdf5s(
                     for i in range(n_spectra):
                         dformat_array[i] = dformats.assign_dformat(spectra[i], prec_mz=prec_mzs[i])
                     container.create_dataset('dformat', data=dformat_array)
-                mergeable_keys = sorted(k for k in container.keys() if k not in skip_keys)
+                # Only flat datasets are concatenated via the union-key loop.
+                # Groups (e.g. /features) and the feature_id FK column are
+                # special-cased below with proper offsetting across files.
+                mergeable_keys = sorted(
+                    k for k in container.keys()
+                    if k not in skip_keys
+                    and k != 'feature_id'
+                    and not isinstance(container[k], h5py.Group)
+                )
                 for k in mergeable_keys:
                     if k not in key_specs:
                         ds = container[k]
@@ -1703,6 +1885,17 @@ def merge_lcmsms_hdf5s(
             f_out[name][-data.shape[0]:] = data
 
     # Pass 2: Merge validated inputs
+    feature_cumulative_offset = 0  # rolling sum across inputs' /features groups
+    feature_column_specs = {}  # name → dtype, tail_shape  (collected from inputs)
+    feature_buffers = {}  # name → list[np.ndarray] (concatenated after pass 2)
+
+    def _feature_register(name, ds):
+        if name not in feature_column_specs:
+            feature_column_specs[name] = {
+                'dtype': ds.dtype, 'tail_shape': ds.shape[1:],
+            }
+            feature_buffers[name] = []
+
     with h5py.File(out_pth, 'w') as f_out:
         for file_id, entry in enumerate(
             tqdm(valid_inputs, desc='Merging .hdf5 files', disable=not verbose)
@@ -1715,8 +1908,8 @@ def merge_lcmsms_hdf5s(
                 if is_old_format:
                     container = f_in['MSn data']
                     spectra = np.stack([container['mzs'][:], container['intensities'][:]], axis=1)
-                    
-                else: 
+
+                else:
                     container = f_in
                     spectra = container[SPECTRUM][:]
                 if spectra.shape[2] > dformat_filters.max_peaks_n:
@@ -1744,6 +1937,53 @@ def merge_lcmsms_hdf5s(
                         data = _fill_array((n_spectra, *spec['tail_shape']), spec['dtype'])
                     _append_dataset(f_out, key, data, key_specs[key]['dtype'])
 
+                # Optional: features-group + feature_id FK with offsetting.
+                if not is_old_format and 'features' in container and isinstance(container['features'], h5py.Group):
+                    feats_grp = container['features']
+                    n_feats_this = feats_grp['feature_id'].shape[0] if 'feature_id' in feats_grp else 0
+
+                    # FK column: offset non-(-1) feature ids by the running total.
+                    if 'feature_id' in container and not isinstance(container['feature_id'], h5py.Group):
+                        fids_in = container['feature_id'][:].astype(np.int32)
+                        fids_out = np.where(fids_in >= 0,
+                                            fids_in + feature_cumulative_offset,
+                                            -1).astype(np.int32)
+                    else:
+                        fids_out = np.full(n_spectra, -1, dtype=np.int32)
+                    _append_dataset(f_out, 'feature_id', fids_out, np.int32)
+
+                    # Stash each /features column for post-loop concatenation.
+                    iso_offsets_prev_tail = None
+                    for col in feats_grp.keys():
+                        _feature_register(col, feats_grp[col])
+                        arr = feats_grp[col][:]
+                        if col == 'feature_id':
+                            arr = (arr.astype(np.int32)
+                                   + feature_cumulative_offset).astype(np.int32)
+                        elif col == 'isotope_offsets':
+                            # Cumulative across the merged corpus. Each file's
+                            # offsets start at 0 — shift by the running total
+                            # of isotope-peaks seen so far, and DROP the leading
+                            # 0 so concatenation stays contiguous (the very
+                            # first file keeps its leading 0).
+                            running_iso = sum(
+                                a[-1] for a in feature_buffers.get('isotope_offsets', [])
+                                if len(a) > 0
+                            ) if feature_buffers.get('isotope_offsets') else 0
+                            arr = arr.astype(np.int32) + np.int32(running_iso)
+                            if feature_buffers.get('isotope_offsets'):
+                                arr = arr[1:]  # avoid duplicate sentinel
+                        feature_buffers[col].append(arr)
+                    feature_cumulative_offset += n_feats_this
+                elif 'feature_id' in container and not isinstance(container['feature_id'], h5py.Group):
+                    # Input has feature_id at root but no /features group —
+                    # shouldn't happen with our pipeline; preserve a placeholder.
+                    _append_dataset(
+                        f_out, 'feature_id',
+                        np.full(n_spectra, -1, dtype=np.int32),
+                        np.int32,
+                    )
+
                 if store_acc_est:
                     acc_est = _coerce_metadata_value(
                         'TBXICs median stdev', f_in.attrs.get('TBXICs median stdev')
@@ -1758,6 +1998,20 @@ def merge_lcmsms_hdf5s(
                 metadata_buffers[field].append(entry['metadata'][field])
             metadata_buffers['file_name'].append(in_pth.stem)
 
+        # Concatenate stashed /features columns into a single /features group.
+        if feature_buffers:
+            features_group_out = f_out.create_group('features')
+            for col, parts in feature_buffers.items():
+                if not parts:
+                    continue
+                concat = np.concatenate(parts, axis=0)
+                features_group_out.create_dataset(
+                    col, data=concat,
+                    dtype=feature_column_specs[col]['dtype'],
+                    compression=compression,
+                    compression_opts=compression_level if compression == 'gzip' else None,
+                )
+
         # Write per-file metadata group
         metadata_group = f_out.create_group('metadata')
         metadata_types = {
@@ -1770,6 +2024,13 @@ def merge_lcmsms_hdf5s(
             'instrument name': h5py.string_dtype('utf-8'),
             'name': h5py.string_dtype('utf-8'),
             'file_name': h5py.string_dtype('utf-8'),
+            'instrument_family': h5py.string_dtype('utf-8'),
+            'acquisition_mode': h5py.string_dtype('utf-8'),
+            'auto_tol_mz_ppm': np.float64,
+            'dia_window_width_da': np.float64,
+            'dreams_io_version': h5py.string_dtype('utf-8'),
+            'n_ms1_spectra': np.int64,
+            'n_msn_collected': np.int64,
         }
         for field, dtype in metadata_types.items():
             metadata_group.create_dataset(

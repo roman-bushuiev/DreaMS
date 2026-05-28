@@ -176,6 +176,7 @@ def load_hdf5_in_mem(dct):
 
 class MSData:
     DEFAULT_METADATA_FK = 'file_id'
+    DEFAULT_FEATURES_FK = 'feature_id'
 
     def __init__(
             self,
@@ -187,6 +188,8 @@ class MSData:
             index_col: Optional[str] = None,
             metadata_group: Optional[str] = None,
             metadata_fk: Optional[str] = None,
+            features_group: Optional[str] = None,
+            features_fk: Optional[str] = None,
         ):
         if isinstance(hdf5_pth, list):
             self.f = io.ChunkedHDF5File(hdf5_pth)
@@ -218,38 +221,71 @@ class MSData:
         self.data = self.f
         self.mode = mode
 
-        self.metadata_group_name = metadata_group
-        self.metadata_fk = metadata_fk if metadata_group is not None else None
-        self.num_metadata_rows = 0
-        self.metadata_data = None
-        if metadata_group is not None:
-            if self.metadata_fk is None:
-                self.metadata_fk = self.DEFAULT_METADATA_FK
-            if metadata_group not in self.f.keys() or not isinstance(self.f[metadata_group], h5py.Group):
-                raise ValueError(f'Metadata group "{metadata_group}" not found at root of {hdf5_pth}.')
-            grp = self.f[metadata_group]
-            lengths = {grp[k].shape[0] for k in grp.keys()}
-            if len(lengths) != 1:
-                raise ValueError(f'Metadata group "{metadata_group}" has inconsistent column lengths: {lengths}.')
-            self.num_metadata_rows = lengths.pop()
-            if self.metadata_fk not in self.f.keys() or isinstance(self.f[self.metadata_fk], h5py.Group):
-                raise ValueError(f'Metadata FK column "{self.metadata_fk}" not found at root of {hdf5_pth}.')
-            if not np.issubdtype(self.f[self.metadata_fk].dtype, np.integer):
-                raise ValueError(f'Metadata FK column "{self.metadata_fk}" must be integer dtype, got {self.f[self.metadata_fk].dtype}.')
-            if self.f[self.metadata_fk].shape != (self.num_spectra,):
-                raise ValueError(f'Metadata FK column "{self.metadata_fk}" shape {self.f[self.metadata_fk].shape} != (num_spectra={self.num_spectra},).')
-            self.metadata_data = self.f[metadata_group]
+        # Attach metadata + features groups via the shared validator.
+        (self.metadata_group_name, self.metadata_fk,
+         self.num_metadata_rows, self.metadata_data) = self._attach_group(
+            metadata_group, metadata_fk, self.DEFAULT_METADATA_FK, "Metadata",
+        )
+        (self.features_group_name, self.features_fk,
+         self.num_feature_rows, self.features_data) = self._attach_group(
+            features_group, features_fk, self.DEFAULT_FEATURES_FK, "Features",
+        )
 
         if in_mem:
             print(f'Loading dataset {self.hdf5_pth.stem} into memory ({self.num_spectra} {"spectra" if self.num_spectra > 1 else "spectrum"})...')
             self.data = self.load_hdf5_in_mem(self.f)
-            if metadata_group is not None:
-                self.metadata_data = self.data[metadata_group]
+            if self.metadata_group_name is not None:
+                self.metadata_data = self.data[self.metadata_group_name]
+            if self.features_group_name is not None:
+                self.features_data = self.data[self.features_group_name]
 
         self.index_col = index_col
         self.index_to_i = None
         if index_col is not None:
             self.use_col_as_index(index_col)
+
+    def _attach_group(self, group_name, fk_name, default_fk, label):
+        """Validate and bind a (group, fk_column) pair at the HDF5 root.
+
+        Returns ``(group_name, resolved_fk_name, num_rows, group_handle)`` or
+        ``(None, None, 0, None)`` when ``group_name`` is None.
+
+        ``num_rows`` is the dominant column length in the group; columns whose
+        length matches go into one bucket, columns with other lengths
+        (e.g. ragged isotope-pattern flat arrays in a /features group) are
+        tolerated. The integer FK column at root must have shape (num_spectra,)
+        and point into the ``num_rows`` rows of the group.
+        """
+        if group_name is None:
+            return None, None, 0, None
+        fk = fk_name if fk_name is not None else default_fk
+        if (group_name not in self.f.keys()
+                or not isinstance(self.f[group_name], h5py.Group)):
+            raise ValueError(
+                f'{label} group "{group_name}" not found at root of {self.hdf5_pth}.'
+            )
+        grp = self.f[group_name]
+        # Pick the most common column length as canonical num_rows. This is
+        # robust to ragged auxiliary columns (e.g. /features/isotope_*).
+        length_counts = Counter(grp[k].shape[0] for k in grp.keys() if grp[k].ndim >= 1)
+        if not length_counts:
+            raise ValueError(f'{label} group "{group_name}" has no columns.')
+        num_rows = length_counts.most_common(1)[0][0]
+        if fk not in self.f.keys() or isinstance(self.f[fk], h5py.Group):
+            raise ValueError(
+                f'{label} FK column "{fk}" not found at root of {self.hdf5_pth}.'
+            )
+        if not np.issubdtype(self.f[fk].dtype, np.integer):
+            raise ValueError(
+                f'{label} FK column "{fk}" must be integer dtype, '
+                f'got {self.f[fk].dtype}.'
+            )
+        if self.f[fk].shape != (self.num_spectra,):
+            raise ValueError(
+                f'{label} FK column "{fk}" shape {self.f[fk].shape} '
+                f'!= (num_spectra={self.num_spectra},).'
+            )
+        return group_name, fk, num_rows, self.f[group_name]
 
     def __del__(self):
         try:
@@ -286,6 +322,70 @@ class MSData:
             elif hasattr(out, 'dtype') and out.dtype == object:
                 out = np.array([s.decode('utf-8') if isinstance(s, bytes) else s for s in out])
         return out
+
+    def features_columns(self):
+        if self.features_data is None:
+            return []
+        return list(self.features_data.keys())
+
+    def get_feature(self, col, spec_idx=None, decode_strings=True):
+        """Read a /features-group column. If ``spec_idx`` is given, follow the
+        feature_id FK from the MS2 row(s) to the parent feature row(s).
+
+        Orphan MS2 (feature_id == -1) raises an IndexError if a scalar
+        ``spec_idx`` resolves to -1; for array-like ``spec_idx`` orphans return
+        whatever ``raw[:]`` produces at index -1 (typically the last row).
+        Callers should filter on ``feature_id != -1`` first when iterating.
+        """
+        if self.features_data is None:
+            raise ValueError('No features_group configured for this MSData instance.')
+        raw = self.features_data[col]
+        if spec_idx is None:
+            out = raw[:]
+        else:
+            fk = self.data[self.features_fk] if self.in_mem else self.f[self.features_fk]
+            if isinstance(spec_idx, (int, np.integer)):
+                row = int(fk[int(spec_idx)])
+                if row == -1:
+                    raise IndexError(
+                        f'spec_idx={int(spec_idx)} has feature_id == -1 (orphan MS2; '
+                        'no parent feature). Filter on feature_id first.'
+                    )
+                out = raw[row]
+            else:
+                fk_arr = np.asarray(fk[:])
+                rows = fk_arr[spec_idx]
+                out = np.asarray(raw[:])[rows]
+        if decode_strings:
+            if isinstance(out, bytes):
+                out = out.decode('utf-8')
+            elif hasattr(out, 'dtype') and out.dtype == object:
+                out = np.array([s.decode('utf-8') if isinstance(s, bytes) else s for s in out])
+        return out
+
+    def feature_at(self, spec_idx, decode_strings=True):
+        if self.features_data is None:
+            return {}
+        try:
+            return {k: self.get_feature(k, spec_idx=spec_idx, decode_strings=decode_strings)
+                    for k in self.features_columns()}
+        except IndexError:
+            return {}
+
+    def get_isotope_pattern(self, feature_row_idx):
+        """Slice a feature's isotope-pattern arrays from the flat+offsets layout.
+
+        Returns ``(mz_array, intensity_array)`` for the feature at row index
+        ``feature_row_idx`` within the /features group (not the spec_idx).
+        """
+        if self.features_data is None:
+            raise ValueError('No features_group configured for this MSData instance.')
+        offs = self.features_data['isotope_offsets']
+        lo = int(offs[int(feature_row_idx)])
+        hi = int(offs[int(feature_row_idx) + 1])
+        mz = self.features_data['isotope_mz_flat'][lo:hi]
+        intens = self.features_data['isotope_intens_flat'][lo:hi]
+        return np.asarray(mz), np.asarray(intens)
 
     def metadata_at(self, spec_idx, decode_strings=True):
         if self.metadata_data is None:
