@@ -2415,9 +2415,33 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
         return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": skip_reason}
     mode = detect_acquisition_mode(mzml_pth, exp=exp)
     attrs["acquisition_mode"] = mode.value
-    if mode is not AcquisitionMode.DDA_CENTROID:
+    if mode in (AcquisitionMode.DDA_PROFILE, AcquisitionMode.DIA):
         return (pd.DataFrame(), [], attrs,
                 {"ok": False, "skip_reason": f"acquisition_mode:{mode.value}"})
+    if mode is AcquisitionMode.UNKNOWN:
+        # No MSn present to classify the run (common for MS1-only standards /
+        # isotope-labeling experiments). Feature detection only needs centroided
+        # MS1, so accept the file when its first MS1 scan is centroid; skip
+        # profile MS1 (would need peak-picking) or a file with no MS1 at all.
+        _ms1_type = None
+        for _s in exp:
+            if _s.getMSLevel() == 1:
+                _ms1_type = get_spectrum_type(_s)
+                if _ms1_type in (SpecType.UNKNOWN, None):
+                    _mzs, _ints = _s.get_peaks()
+                    _mzs = np.asarray(_mzs, dtype=float)
+                    if len(_mzs):
+                        _o = np.argsort(_mzs)
+                        _ms1_type = estimate_peak_list_type(
+                            np.vstack([_mzs[_o], np.asarray(_ints, dtype=float)[_o]]),
+                            to_int=False)
+                break
+        if _ms1_type == SpecType.PROFILE:
+            return (pd.DataFrame(), [], attrs,
+                    {"ok": False, "skip_reason": "acquisition_mode:ms1_profile"})
+        if _ms1_type is None:
+            return (pd.DataFrame(), [], attrs,
+                    {"ok": False, "skip_reason": "no_ms1_spectra"})
 
     fam_ppm = INSTRUMENT_FAMILIES[instrument_family]["ppm_default"]
     resolved_ppm = float(tol_mz_ppm if tol_mz_ppm is not None
