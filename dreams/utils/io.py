@@ -618,6 +618,7 @@ def read_mzml(
     log_path: Optional[Union[Path, str]] = None,
     logger=None,
     compute_features: bool = False,
+    feature_method: str = "sirius",
     sirius_workdir: Optional[Union[Path, str]] = None,
     sirius_port: Optional[int] = None,
     sirius_tol_mz_ppm: Optional[float] = None,
@@ -691,7 +692,7 @@ def read_mzml(
         # Instrument-family + acquisition-mode metadata (always computed, not
         # only when compute_features=True). Lands in HDF5 root attrs → /metadata.
         _family = lcms.classify_instrument_family(instrument_name)
-        _mode, _dia_w = lcms.detect_acquisition_mode(pth, return_diagnostics=True)
+        _mode, _dia_w = lcms.detect_acquisition_mode(pth, return_diagnostics=True, exp=exp)
         _auto_ppm = lcms.INSTRUMENT_FAMILIES[_family]['ppm_default']
         file_props['instrument_family'] = _family
         file_props['acquisition_mode'] = _mode.value
@@ -930,6 +931,7 @@ def read_mzml(
             try:
                 from dreams.utils.lcms import (
                     compute_features_for_mzml, compute_features_via_rest,
+                    compute_features_via_openms, OPENMS_METHODS,
                     attach_features_group, link_ms2_to_features,
                 )
                 _sirius_workdir = (
@@ -937,7 +939,13 @@ def read_mzml(
                     else Path(output_path).parent / "sirius_work"
                 )
                 _sirius_workdir.mkdir(parents=True, exist_ok=True)
-                if sirius_rest_url:
+                if feature_method in OPENMS_METHODS:
+                    # Pure-CPU OpenMS path: no JVM, no auth, no persistent server.
+                    feats_df, isotope_patterns, attrs, status = compute_features_via_openms(
+                        pth, _sirius_workdir, method=feature_method,
+                        tol_mz_ppm=sirius_tol_mz_ppm,
+                    )
+                elif sirius_rest_url:
                     # Persistent-server path: all SIRIUS work runs inside one
                     # already-authenticated server over HTTP (no per-file auth).
                     feats_df, isotope_patterns, attrs, status = compute_features_via_rest(
