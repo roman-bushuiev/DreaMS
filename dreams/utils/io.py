@@ -618,7 +618,7 @@ def read_mzml(
     log_path: Optional[Union[Path, str]] = None,
     logger=None,
     compute_features: bool = False,
-    feature_method: str = "sirius",
+    feature_method: str = "openms_dreams",
     sirius_workdir: Optional[Union[Path, str]] = None,
     sirius_port: Optional[int] = None,
     sirius_tol_mz_ppm: Optional[float] = None,
@@ -652,6 +652,23 @@ def read_mzml(
             automatically from output_path or pth if not given.
         logger: Optional pre-configured logger. If provided, used as-is and log_path
             is ignored. If None and store_extra=True, a logger is created automatically.
+        compute_features: If True, run LC-MS feature detection on the mzML and attach
+            a ``/features`` group + a root ``/feature_id`` foreign-key column (one per
+            MS2 spectrum) to the output HDF5. Failures are logged but never invalidate
+            the MS2-only HDF5. Requires output_path.
+        feature_method: Which detector to use. Defaults to ``"openms_dreams"`` — the
+            pure-CPU OpenMS-DreaMS detector (data-driven noise floor, SIRIUS-style
+            quality categories, ion-identity adducts), no JVM / auth / server. Other
+            values: ``"openms_vanilla"`` (stock pyOpenMS baseline), or ``"sirius"`` to
+            route through SIRIUS (subprocess, or REST when ``sirius_rest_url`` is set).
+            All detectors write the same ``/features`` schema.
+        sirius_workdir: Working directory for feature detection (reused by every
+            method; defaults to ``<output_path>/../sirius_work``).
+        sirius_port / sirius_workspace / sirius_rest_url: SIRIUS-only options
+            (ignored by the OpenMS methods).
+        sirius_tol_mz_ppm / sirius_tol_rt_s: m/z (ppm) and RT (s) tolerances for
+            linking MS2 spectra to features; m/z defaults to the instrument-resolved
+            value when None.
     """
     if isinstance(pth, str):
         pth = Path(pth)
