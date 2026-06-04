@@ -2095,7 +2095,7 @@ def attach_features_group(hdf5_pth,
 #   * "openms_vanilla"  — stock pyopenms metabolomics defaults; a bare feature
 #     list (all quality = NOT_APPLICABLE, no adducts). The honest
 #     out-of-the-box baseline.
-#   * "openms_enhanced" — made *data-driven like SIRIUS*: per-file MS1 noise
+#   * "openms_dreams" — made *data-driven like SIRIUS*: per-file MS1 noise
 #     floor estimated from the intensity distribution (GlobalNoiseModel analog,
 #     replacing the fixed noise_threshold_int=10.0), auto elution-peak width
 #     filtering, and instrument-resolved mass tolerance; plus SIRIUS-style
@@ -2110,7 +2110,7 @@ def attach_features_group(hdf5_pth,
 # (parse_adduct_mass_shift / assign_compound_ids_by_adduct).
 # ---------------------------------------------------------------------------
 
-OPENMS_METHODS = ("openms_vanilla", "openms_enhanced")
+OPENMS_METHODS = ("openms_vanilla", "openms_dreams")
 
 # Per-polarity adduct vocabulary for the enhanced arm's ion-identity network.
 # primary = base ionization; alternatives = co-eluting ion forms / in-source
@@ -2367,7 +2367,7 @@ def assign_adducts_by_network(features_df: pd.DataFrame, polarity: str,
 
 
 def compute_features_via_openms(mzml_pth, work_dir=None,
-                                method: str = "openms_enhanced",
+                                method: str = "openms_dreams",
                                 tol_mz_ppm: Optional[float] = None,
                                 noise_quantile: float = 0.05,
                                 adduct_min_shape_corr: float = 0.85):
@@ -2376,7 +2376,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     ``method`` is one of :data:`OPENMS_METHODS`:
       * ``"openms_vanilla"`` — stock pyopenms 3-stage feature finding; bare
         feature list (quality NOT_APPLICABLE, no adducts).
-      * ``"openms_enhanced"`` — data-driven noise floor + auto width filtering +
+      * ``"openms_dreams"`` — data-driven noise floor + auto width filtering +
         instrument-resolved tolerance, SIRIUS-style quality categories,
         ion-identity adducts/in-source fragments, MS2 linkage.
 
@@ -2389,7 +2389,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     if method not in OPENMS_METHODS:
         raise ValueError(f"Unknown OpenMS method {method!r}; expected one of {OPENMS_METHODS}")
     mzml_pth = Path(mzml_pth)
-    is_enhanced = (method == "openms_enhanced")
+    is_enhanced = (method == "openms_dreams")
 
     # Load the full experiment once up front. IIMN/msConvert mzMLs are often
     # non-indexed (no <indexList>), which OnDiscMSExperiment cannot read, so we
