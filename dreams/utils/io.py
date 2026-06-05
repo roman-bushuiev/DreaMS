@@ -1027,8 +1027,8 @@ def _write_flat_hdf5(
     n_highest_peaks: int = 128,
     file_props: Optional[dict] = None,
     store_extra: bool = False,
-    compress_peaks_lvl: int = 3,
-    compress_full_lvl: int = 3,
+    compress_peaks_lvl: int = 6,
+    compress_full_lvl: int = 6,
     logger=None,
 ):
     """Write a DataFrame of spectra to a flat .hdf5 file.
@@ -1089,8 +1089,9 @@ def _write_flat_hdf5(
                 for k, v in file_props.items():
                     hdf_file.attrs[k] = v if v is not None else -1
 
-            # Peak lists — combined (N, 2, peaks) spectrum dataset
-            hdf_file.create_dataset(SPECTRUM, data=peak_lists, compression='gzip',
+            # Peak lists — combined (N, 2, peaks) spectrum dataset. float32 is ample
+            # for m/z + intensity (≈0.1 ppm at m/z 1500) and halves the dominant array.
+            hdf_file.create_dataset(SPECTRUM, data=peak_lists, dtype='f4', compression='gzip',
                                     compression_opts=compress_peaks_lvl)
 
             # Metadata — dtypes and compression match parsed_lcmsms_to_hdf
@@ -1106,7 +1107,7 @@ def _write_flat_hdf5(
                                     compression=compress_full_lvl)
             hdf_file.create_dataset('MS level', data=df['ms_level'], dtype='i1',
                                     compression=compress_full_lvl)
-            hdf_file.create_dataset('positive polarity', data=df['polarity'], dtype='i1',
+            hdf_file.create_dataset('positive polarity', data=df['polarity'].astype(bool), dtype='bool',
                                     compression=compress_full_lvl)
             hdf_file.create_dataset('window lo', data=df['window_lo'], dtype='f4',
                                     compression=compress_full_lvl)
@@ -1809,6 +1810,7 @@ def merge_lcmsms_hdf5s(
     valid_inputs = []
     union_keys = set()
     key_specs = {}
+    feature_union_specs = {}  # /features column name -> {dtype, tail_shape} (union across inputs)
 
     for in_pth in candidates:
         if not verify_hdf5_integrity(in_pth):
@@ -1868,6 +1870,16 @@ def merge_lcmsms_hdf5s(
                         key_specs[k] = {'dtype': ds.dtype, 'tail_shape': ds.shape[1:]}
                 union_keys.update(mergeable_keys)
 
+                # Collect the /features column union so heterogeneous inputs (e.g. a
+                # SIRIUS-only external_feature_id) merge without ragged columns.
+                if (not is_old_format and 'features' in container
+                        and isinstance(container['features'], h5py.Group)):
+                    fg = container['features']
+                    for fk in fg.keys():
+                        if fk not in feature_union_specs:
+                            feature_union_specs[fk] = {'dtype': fg[fk].dtype,
+                                                       'tail_shape': fg[fk].shape[1:]}
+
                 metadata = {
                     field: _coerce_metadata_value(field, f_in.attrs.get(field))
                     for field in metadata_fields
@@ -1909,17 +1921,21 @@ def merge_lcmsms_hdf5s(
             f_out[name].resize(f_out[name].shape[0] + data.shape[0], axis=0)
             f_out[name][-data.shape[0]:] = data
 
-    # Pass 2: Merge validated inputs
-    feature_cumulative_offset = 0  # rolling sum across inputs' /features groups
-    feature_column_specs = {}  # name → dtype, tail_shape  (collected from inputs)
-    feature_buffers = {}  # name → list[np.ndarray] (concatenated after pass 2)
-
-    def _feature_register(name, ds):
-        if name not in feature_column_specs:
-            feature_column_specs[name] = {
-                'dtype': ds.dtype, 'tail_shape': ds.shape[1:],
-            }
-            feature_buffers[name] = []
+    # Pass 2: Merge validated inputs.
+    #   feature_id / compound_id are PER-FILE indices -> offset so they stay globally
+    #     unique across the merged corpus.
+    #   consensus_id is MSV-level (same id across files == the same aligned feature)
+    #     -> preserved as-is (NOT offset).
+    #   a per-feature file_id is added for provenance.
+    feature_cumulative_offset = 0   # running #features    (offsets feature_id)
+    compound_cumulative_offset = 0  # running #ion-identity groups (offsets compound_id)
+    iso_flat_total = 0              # running #isotope peaks (shifts isotope_offsets)
+    _FEATURE_FLAT = {'isotope_mz_flat', 'isotope_intens_flat'}  # length != n_features
+    feature_column_specs = dict(feature_union_specs)
+    feature_buffers = {name: [] for name in feature_union_specs}
+    if feature_union_specs:  # add per-feature provenance column
+        feature_column_specs['file_id'] = {'dtype': np.dtype(np.int32), 'tail_shape': ()}
+        feature_buffers['file_id'] = []
 
     with h5py.File(out_pth, 'w') as f_out:
         for file_id, entry in enumerate(
@@ -1962,52 +1978,59 @@ def merge_lcmsms_hdf5s(
                         data = _fill_array((n_spectra, *spec['tail_shape']), spec['dtype'])
                     _append_dataset(f_out, key, data, key_specs[key]['dtype'])
 
-                # Optional: features-group + feature_id FK with offsetting.
-                if not is_old_format and 'features' in container and isinstance(container['features'], h5py.Group):
+                # Features-group + feature_id FK. Per-file ids are made globally
+                # unique (feature_id, compound_id offset); consensus_id is preserved
+                # (MSV-level); isotope_offsets are shifted onto the merged flat array.
+                if (feature_union_specs and not is_old_format and 'features' in container
+                        and isinstance(container['features'], h5py.Group)):
                     feats_grp = container['features']
-                    n_feats_this = feats_grp['feature_id'].shape[0] if 'feature_id' in feats_grp else 0
+                    n_feats_this = (feats_grp['feature_id'].shape[0]
+                                    if 'feature_id' in feats_grp else 0)
 
-                    # FK column: offset non-(-1) feature ids by the running total.
+                    # root FK: offset non-(-1) feature ids by the running feature total.
                     if 'feature_id' in container and not isinstance(container['feature_id'], h5py.Group):
-                        fids_in = container['feature_id'][:].astype(np.int32)
-                        fids_out = np.where(fids_in >= 0,
-                                            fids_in + feature_cumulative_offset,
-                                            -1).astype(np.int32)
+                        fids_in = container['feature_id'][:].astype(np.int64)
+                        fids_out = np.where(fids_in >= 0, fids_in + feature_cumulative_offset, -1).astype(np.int32)
                     else:
                         fids_out = np.full(n_spectra, -1, dtype=np.int32)
                     _append_dataset(f_out, 'feature_id', fids_out, np.int32)
 
-                    # Stash each /features column for post-loop concatenation.
-                    iso_offsets_prev_tail = None
-                    for col in feats_grp.keys():
-                        _feature_register(col, feats_grp[col])
-                        arr = feats_grp[col][:]
-                        if col == 'feature_id':
-                            arr = (arr.astype(np.int32)
-                                   + feature_cumulative_offset).astype(np.int32)
+                    file_iso_len = int(feats_grp['isotope_offsets'][-1]) if 'isotope_offsets' in feats_grp else 0
+                    max_cid_this = -1
+                    for col, spec in feature_union_specs.items():
+                        if col in feats_grp:
+                            arr = feats_grp[col][:]
+                        elif col in _FEATURE_FLAT:
+                            arr = _fill_array((0, *spec['tail_shape']), spec['dtype'])
                         elif col == 'isotope_offsets':
-                            # Cumulative across the merged corpus. Each file's
-                            # offsets start at 0 — shift by the running total
-                            # of isotope-peaks seen so far, and DROP the leading
-                            # 0 so concatenation stays contiguous (the very
-                            # first file keeps its leading 0).
-                            running_iso = sum(
-                                a[-1] for a in feature_buffers.get('isotope_offsets', [])
-                                if len(a) > 0
-                            ) if feature_buffers.get('isotope_offsets') else 0
-                            arr = arr.astype(np.int32) + np.int32(running_iso)
-                            if feature_buffers.get('isotope_offsets'):
-                                arr = arr[1:]  # avoid duplicate sentinel
+                            arr = np.zeros(n_feats_this + 1, dtype=spec['dtype'])
+                        else:
+                            arr = _fill_array((n_feats_this, *spec['tail_shape']), spec['dtype'])
+
+                        if col == 'feature_id':
+                            arr = (arr.astype(np.int64) + feature_cumulative_offset).astype(spec['dtype'])
+                        elif col == 'compound_id':
+                            assigned = arr >= 0
+                            if assigned.any():
+                                max_cid_this = int(arr[assigned].max())
+                            arr = np.where(assigned, arr.astype(np.int64) + compound_cumulative_offset,
+                                           -1).astype(spec['dtype'])
+                        elif col == 'isotope_offsets':
+                            arr = arr.astype(np.int64) + iso_flat_total
+                            if len(feature_buffers['isotope_offsets']) > 0:
+                                arr = arr[1:]  # drop duplicate leading sentinel after the first file
+                            arr = arr.astype(spec['dtype'])
+                        # consensus_id / consensus_n_runs / alignment_quality / etc. -> appended as-is
                         feature_buffers[col].append(arr)
+                    feature_buffers['file_id'].append(np.full(n_feats_this, file_id, dtype=np.int32))
                     feature_cumulative_offset += n_feats_this
-                elif 'feature_id' in container and not isinstance(container['feature_id'], h5py.Group):
-                    # Input has feature_id at root but no /features group —
-                    # shouldn't happen with our pipeline; preserve a placeholder.
-                    _append_dataset(
-                        f_out, 'feature_id',
-                        np.full(n_spectra, -1, dtype=np.int32),
-                        np.int32,
-                    )
+                    compound_cumulative_offset += max_cid_this + 1
+                    iso_flat_total += file_iso_len
+                elif feature_union_specs or (
+                        'feature_id' in container and not isinstance(container['feature_id'], h5py.Group)):
+                    # Other inputs carry features but this one does not -> -1 FK, 0 feature rows.
+                    _append_dataset(f_out, 'feature_id',
+                                    np.full(n_spectra, -1, dtype=np.int32), np.int32)
 
                 if store_acc_est:
                     acc_est = _coerce_metadata_value(
@@ -2024,18 +2047,33 @@ def merge_lcmsms_hdf5s(
             metadata_buffers['file_name'].append(in_pth.stem)
 
         # Concatenate stashed /features columns into a single /features group.
-        if feature_buffers:
+        if feature_union_specs:
             features_group_out = f_out.create_group('features')
+            per_feature_len = {}
             for col, parts in feature_buffers.items():
-                if not parts:
-                    continue
-                concat = np.concatenate(parts, axis=0)
+                concat = (np.concatenate(parts, axis=0) if parts
+                          else _fill_array((0, *feature_column_specs[col]['tail_shape']),
+                                           feature_column_specs[col]['dtype']))
                 features_group_out.create_dataset(
                     col, data=concat,
                     dtype=feature_column_specs[col]['dtype'],
                     compression=compression,
                     compression_opts=compression_level if compression == 'gzip' else None,
                 )
+                if col not in _FEATURE_FLAT and col != 'isotope_offsets':
+                    per_feature_len[col] = concat.shape[0]
+            # Integrity: every per-feature column must share one length, isotope_offsets
+            # must be that length + 1 and end exactly at the flat-array length.
+            if len(set(per_feature_len.values())) > 1:
+                raise ValueError(f'Merged /features column length mismatch: {per_feature_len}')
+            nfeat = next(iter(per_feature_len.values()), 0)
+            if 'isotope_offsets' in features_group_out:
+                off = features_group_out['isotope_offsets'][:]
+                flat = features_group_out['isotope_mz_flat'].shape[0] if 'isotope_mz_flat' in features_group_out else 0
+                if len(off) != nfeat + 1 or (len(off) and int(off[-1]) != flat):
+                    raise ValueError(
+                        f'Merged isotope_offsets inconsistent: len={len(off)} (expect {nfeat+1}), '
+                        f'last={int(off[-1]) if len(off) else None} (expect flat_len {flat}).')
 
         # Write per-file metadata group
         metadata_group = f_out.create_group('metadata')
