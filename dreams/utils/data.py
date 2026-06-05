@@ -430,7 +430,7 @@ class MSData:
         ignore_cols=(),
         in_mem=True,
         hdf5_pth=None,
-        compression_opts=0,
+        compression_opts=6,
         mode='r'
     ):
 
@@ -471,7 +471,7 @@ class MSData:
                         p = su.trim_peak_list(p, n_highest_peaks)
                         p = su.pad_peak_list(p, n_highest_peaks)
                         pls.append(p)
-                    v = np.stack(pls)
+                    v = np.stack(pls).astype('float32')  # float32 spectra (ample for m/z+intensity)
                 else:
                     if k == prec_mz_col:
                         k = PRECURSOR_MZ
@@ -505,21 +505,42 @@ class MSData:
         verbose_parser: bool = False,
         store_extra: bool = False,
         log_path: Optional[Union[Path, str]] = None,
+        compute_features: bool = False,
+        feature_method: str = 'openms_dreams',
+        feature_workdir: Optional[Union[Path, str]] = None,
+        tol_mz_ppm: Optional[float] = None,
+        tol_rt_s: float = 5.0,
+        n_highest_peaks: int = 128,
+        in_mem: bool = False,
         **kwargs
     ):
         pth = Path(pth)
-        logger = None
-        if store_extra:
-            log_path = log_path or str(output_pth.with_suffix('.log'))
-            logger = io.setup_logger(log_path, log_name=pth.stem)
-        df = io.read_mzml(pth, output_path=output_pth, scan_range=scan_range, verbose=verbose_parser, store_extra=store_extra, logger=logger)
-
-        hdf5_pth = output_pth
-        if output_pth is None:
-            hdf5_pth = pth.with_suffix('.hdf5')
+        hdf5_pth = output_pth if output_pth is not None else pth.with_suffix('.hdf5')
         if scan_range:
             hdf5_pth = io.append_to_stem(pth, f'scans_{scan_range[0]}-{scan_range[1]}')
-        return MSData.from_pandas(df, hdf5_pth=hdf5_pth, **kwargs)
+
+        if compute_features:
+            # read_mzml (store_extra) writes the complete MSData-format HDF5 *and*
+            # attaches the /features group + /feature_id FK; load it directly. We do
+            # NOT round-trip through from_pandas — its mode='w' write would clobber
+            # the /features group. feature_method defaults to the pure-CPU
+            # OpenMS-DreaMS detector (no SIRIUS server/auth).
+            io.read_mzml(
+                pth, output_path=hdf5_pth, scan_range=scan_range, verbose=verbose_parser,
+                store_extra=True, compute_features=True, feature_method=feature_method,
+                n_highest_peaks=n_highest_peaks, sirius_workdir=feature_workdir,
+                sirius_tol_mz_ppm=tol_mz_ppm, sirius_tol_rt_s=tol_rt_s,
+            )
+            return MSData(hdf5_pth, in_mem=in_mem, features_group='features',
+                          features_fk='feature_id', **kwargs)
+
+        logger = None
+        if store_extra:
+            log_path = log_path or str(Path(hdf5_pth).with_suffix('.log'))
+            logger = io.setup_logger(log_path, log_name=pth.stem)
+        df = io.read_mzml(pth, output_path=output_pth, scan_range=scan_range,
+                          verbose=verbose_parser, store_extra=store_extra, logger=logger)
+        return MSData.from_pandas(df, hdf5_pth=hdf5_pth, in_mem=in_mem, **kwargs)
 
     @staticmethod
     def from_mzxml(
