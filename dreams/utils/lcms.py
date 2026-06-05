@@ -2016,6 +2016,8 @@ def attach_features_group(hdf5_pth,
         iso_mz_flat = np.zeros(0, dtype=np.float32)
         iso_in_flat = np.zeros(0, dtype=np.float32)
 
+    CL = 6  # gzip level (was 4) — denser default
+
     with h5py.File(hdf5_pth, "a") as f:
         # FK column on the MS2 rows (root level).
         if fk_dataset_name in f:
@@ -2023,7 +2025,7 @@ def attach_features_group(hdf5_pth,
         f.create_dataset(fk_dataset_name,
                          data=np.asarray(feature_id_per_ms2, dtype=np.int32),
                          shape=(n_ms2,),
-                         compression="gzip", compression_opts=4)
+                         compression="gzip", compression_opts=CL)
 
         # Features group.
         if group_name in f:
@@ -2033,58 +2035,144 @@ def attach_features_group(hdf5_pth,
         if n_features > 0:
             g.create_dataset("feature_id",
                              data=features_df["feature_id"].to_numpy(np.int32),
-                             compression="gzip", compression_opts=4)
-            g.create_dataset(
-                "sirius_feature_id",
-                data=np.asarray(features_df["sirius_feature_id"].tolist(),
-                                dtype=h5py.string_dtype(encoding="utf-8")),
-                compression="gzip", compression_opts=4,
-            )
-            g.create_dataset("external_feature_id",
-                             data=features_df["external_feature_id"].to_numpy(np.int32),
-                             compression="gzip", compression_opts=4)
-            # SIRIUS compound id — groups features that are different ion forms
-            # / fragments of the same neutral molecule (ion identity network).
-            g.create_dataset(
-                "compound_id",
-                data=np.asarray(features_df["compound_id"].tolist(),
-                                dtype=h5py.string_dtype(encoding="utf-8")),
-                compression="gzip", compression_opts=4,
-            )
+                             compression="gzip", compression_opts=CL)
+            # external_feature_id only when a detector actually populates it (SIRIUS);
+            # the OpenMS path leaves it unset (-1 everywhere) — don't store dead weight.
+            ext = features_df["external_feature_id"].to_numpy(np.int32)
+            if not (ext == -1).all():
+                g.create_dataset("external_feature_id", data=ext,
+                                 compression="gzip", compression_opts=CL)
+            # compound_id (ion-identity group: ion forms / fragments of one neutral
+            # molecule) as compact int32 codes — distinct non-empty groups -> 0..K-1,
+            # unassigned -> -1 (was a mostly-empty variable-length string column).
+            codes = np.full(n_features, -1, dtype=np.int32)
+            _seen = {}
+            for i, s in enumerate(features_df["compound_id"].tolist()):
+                s = "" if s is None else str(s)
+                if s and s.lower() not in ("nan", "none"):
+                    codes[i] = _seen.setdefault(s, len(_seen))
+            g.create_dataset("compound_id", data=codes,
+                             compression="gzip", compression_opts=CL)
             for col, dtype in [
                 ("mz_apex", np.float32), ("rt_apex_s", np.float32),
                 ("rt_start_s", np.float32), ("rt_end_s", np.float32),
                 ("area", np.float32),
             ]:
                 g.create_dataset(col, data=features_df[col].to_numpy(dtype),
-                                 compression="gzip", compression_opts=4)
-            for col in ("charge", "adduct_charge", "has_ms1", "has_ms2"):
+                                 compression="gzip", compression_opts=CL)
+            for col in ("charge", "adduct_charge"):
                 g.create_dataset(col, data=features_df[col].to_numpy(np.int8),
-                                 compression="gzip", compression_opts=4)
+                                 compression="gzip", compression_opts=CL)
+            for col in ("has_ms1", "has_ms2"):  # genuinely boolean
+                g.create_dataset(col, data=features_df[col].to_numpy(bool),
+                                 compression="gzip", compression_opts=CL)
             for q in ("peak_quality", "alignment_quality", "isotope_quality",
                       "ms2_quality", "adduct_quality", "overall_quality"):
                 g.create_dataset(q, data=features_df[q].to_numpy(np.int8),
-                                 compression="gzip", compression_opts=4)
+                                 compression="gzip", compression_opts=CL)
             for col, slen in (("adduct", 32), ("alternative_adducts", 64)):
                 g.create_dataset(
                     col,
                     data=np.asarray(features_df[col].tolist(),
                                     dtype=h5py.string_dtype(encoding="utf-8",
                                                            length=slen)),
-                    compression="gzip", compression_opts=4,
+                    compression="gzip", compression_opts=CL,
                 )
 
         # Ragged isotope patterns (flat + offsets).
         g.create_dataset("isotope_mz_flat", data=iso_mz_flat,
-                         compression="gzip", compression_opts=4)
+                         compression="gzip", compression_opts=CL)
         g.create_dataset("isotope_intens_flat", data=iso_in_flat,
-                         compression="gzip", compression_opts=4)
+                         compression="gzip", compression_opts=CL)
         g.create_dataset("isotope_offsets", data=iso_offsets,
-                         compression="gzip", compression_opts=4)
+                         compression="gzip", compression_opts=CL)
 
         # Group attrs.
         for k, v in attrs.items():
             g.attrs[k] = str(v) if v is not None else ""
+
+
+def prune_features_without_ms2(hdf5_pth, group_name: str = "features",
+                               fk_dataset_name: str = "feature_id") -> tuple:
+    """Drop MS1-only features (the 'align-then-prune' disk-saving step).
+
+    Keeps exactly the features referenced by >=1 MS2 spectrum (via the root FK),
+    so no MS2 is orphaned, then writes a fresh compacted HDF5 (all root datasets
+    copied with their filters; the /features group rebuilt with per-feature columns
+    + ragged isotope arrays re-sliced; the root FK remapped to the new indices) and
+    atomically replaces the original. A fresh file is required because in-place
+    HDF5 dataset deletion does NOT reclaim space. Run *after* alignment write-back
+    so retained features keep their cross-run consensus stats. No-op if every
+    feature is already referenced or none is (e.g. MS1-only data).
+
+    Returns ``(n_before, n_dropped)``.
+    """
+    import os
+    import h5py
+    hdf5_pth = Path(hdf5_pth)
+    CL = 6
+    with h5py.File(hdf5_pth, "r") as f:
+        if group_name not in f or fk_dataset_name not in f or "feature_id" not in f[group_name]:
+            return (0, 0)
+        g = f[group_name]
+        n_feat = g["feature_id"].shape[0]
+        if n_feat == 0:
+            return (0, 0)
+        fk = f[fk_dataset_name][:]
+        referenced = np.zeros(n_feat, dtype=bool)
+        referenced[fk[fk >= 0]] = True
+        keep = np.where(referenced)[0]
+        n_keep = len(keep)
+        if n_keep == n_feat or n_keep == 0:
+            return (n_feat, 0)  # nothing to gain / would empty an MS1-only file -> skip
+
+        old_to_new = np.full(n_feat, -1, dtype=np.int64)
+        old_to_new[keep] = np.arange(n_keep)
+        ragged = {"isotope_mz_flat", "isotope_intens_flat", "isotope_offsets"}
+        per_feature = {k: g[k][:][keep] for k in g.keys() if k not in ragged}
+        # feature_id is the row position (== FK target); reset it to the compacted range
+        if "feature_id" in per_feature:
+            per_feature["feature_id"] = np.arange(n_keep, dtype=per_feature["feature_id"].dtype)
+        new_off = None
+        if "isotope_offsets" in g:
+            off, mzf, inf = g["isotope_offsets"][:], g["isotope_mz_flat"][:], g["isotope_intens_flat"][:]
+            new_off = np.zeros(n_keep + 1, dtype=np.int32)
+            mz_pieces, in_pieces = [], []
+            for ni, oi in enumerate(keep):
+                a, b = int(off[oi]), int(off[oi + 1])
+                mz_pieces.append(mzf[a:b]); in_pieces.append(inf[a:b])
+                new_off[ni + 1] = new_off[ni] + (b - a)
+            new_mzf = np.concatenate(mz_pieces) if mz_pieces else np.zeros(0, np.float32)
+            new_inf = np.concatenate(in_pieces) if in_pieces else np.zeros(0, np.float32)
+        new_fk = fk.copy()
+        m = fk >= 0
+        new_fk[m] = old_to_new[fk[m]].astype(np.int32)
+        feat_attrs = dict(g.attrs); feat_attrs["pruned_ms1_only"] = "True"
+        root_attrs = dict(f.attrs)
+
+        tmp = hdf5_pth.with_suffix(".prune.tmp.hdf5")
+        with h5py.File(tmp, "w") as dst:
+            for k, v in root_attrs.items():
+                dst.attrs[k] = v
+            for k in f.keys():  # copy every root dataset (preserving filters), bar the FK + features group
+                if k == group_name:
+                    continue
+                if k == fk_dataset_name:
+                    dst.create_dataset(k, data=new_fk.astype(np.int32),
+                                       compression="gzip", compression_opts=CL)
+                else:
+                    f.copy(k, dst)
+            g2 = dst.create_group(group_name)
+            for k, v in per_feature.items():
+                g2.create_dataset(k, data=v, compression="gzip", compression_opts=CL)
+            if new_off is not None:
+                g2.create_dataset("isotope_mz_flat", data=new_mzf, compression="gzip", compression_opts=CL)
+                g2.create_dataset("isotope_intens_flat", data=new_inf, compression="gzip", compression_opts=CL)
+                g2.create_dataset("isotope_offsets", data=new_off, compression="gzip", compression_opts=CL)
+            for k, v in feat_attrs.items():
+                g2.attrs[k] = v
+    os.replace(tmp, hdf5_pth)
+    return (n_feat, n_feat - n_keep)
 
 
 # ---------------------------------------------------------------------------
@@ -2704,3 +2792,251 @@ def standartize_gnps_species(species: pd.Series):
     species = species.rename({'': 'other'})
 
     return species
+
+# ===========================================================================
+# Cross-run alignment -> consensus features (in the DreaMS codebase so the
+# mzML->HDF5 mining pipeline depends only on `dreams`, not on GeMS scripts).
+# ===========================================================================
+_ALIGN_UID_BASE = 100_000_000  # uid = run_idx * base + row_idx (recovers metadata)
+_ALIGN_COLS = ["source", "mz_apex", "rt_apex_s", "rt_start_s", "rt_end_s",
+               "adduct", "has_ms2", "overall_quality", "area", "n_runs", "n_decent_runs"]
+
+
+def read_features_from_hdf5(hdf5_pth, group_name: str = "features"):
+    """Read a /features group into the canonical frame `align_runs` consumes.
+
+    Returns None when the file has no populated /features group.
+    """
+    import h5py
+    with h5py.File(hdf5_pth, "r") as f:
+        g = f.get(group_name)
+        if g is None or "feature_id" not in g or g["feature_id"].shape[0] == 0:
+            return None
+        n = int(g["feature_id"].shape[0])
+
+        def col(name, default, dtype=float):
+            return g[name][:].astype(dtype) if name in g else np.full(n, default, dtype=dtype)
+
+        d = {
+            "source": Path(hdf5_pth).stem,
+            "mz_apex": col("mz_apex", np.nan), "rt_apex_s": col("rt_apex_s", np.nan),
+            "rt_start_s": col("rt_start_s", np.nan), "rt_end_s": col("rt_end_s", np.nan),
+            "area": col("area", np.nan), "overall_quality": col("overall_quality", 0, int),
+            "has_ms2": col("has_ms2", False, bool),
+            "adduct": ([x.decode("utf-8", "ignore") if isinstance(x, (bytes, bytearray)) else str(x)
+                        for x in g["adduct"][:]] if "adduct" in g else [""] * n),
+        }
+        if "n_runs" in g:
+            d["n_runs"] = g["n_runs"][:].astype(int)
+        if "n_decent_runs" in g:
+            d["n_decent_runs"] = g["n_decent_runs"][:].astype(int)
+    return pd.DataFrame(d)
+
+
+def align_runs(frames: list, mz_tol_ppm: float = 10.0, rt_tol_s: float = 20.0,
+               warp: bool = True, return_membership: bool = False):
+    """RT-align + group per-run canonical feature frames into consensus features.
+
+    OpenMS ``FeatureGroupingAlgorithmKD`` (LOWESS RT warp + KD-tree linking) — the
+    cross-sample step SIRIUS ``lcms-align`` / MZmine FBMN perform. Output: one row
+    per consensus feature with the canonical columns + ``n_runs`` (distinct source
+    runs) + ``n_decent_runs`` (members with overall_quality >= 3).
+
+    **Merge mode**: when every input frame already carries ``n_runs``/``n_decent_runs``
+    (i.e. they are themselves consensus tables), the output counts are the SUM of the
+    grouped members' counts — so hierarchical/chunked alignment keeps reproducibility
+    exact. ``return_membership=True`` also returns, per output row, the list of source
+    ``(frame_idx, row_idx)`` members.
+    """
+    import pyopenms as pyms
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        empty = pd.DataFrame(columns=_ALIGN_COLS)
+        return (empty, []) if return_membership else empty
+    merge_mode = all("n_runs" in f.columns and "n_decent_runs" in f.columns for f in frames)
+
+    fmaps, meta = [], []
+    for j, f in enumerate(frames):
+        mz = f["mz_apex"].to_numpy(float); rt = f["rt_apex_s"].to_numpy(float)
+        area = f["area"].to_numpy(float) if "area" in f else np.full(len(f), np.nan)
+        oq = f["overall_quality"].to_numpy(int) if "overall_quality" in f else np.zeros(len(f), int)
+        ms2 = f["has_ms2"].to_numpy(bool) if "has_ms2" in f else np.zeros(len(f), bool)
+        add = f["adduct"].to_numpy(object) if "adduct" in f else np.array([""] * len(f), object)
+        nr = f["n_runs"].to_numpy(int) if merge_mode else None
+        ndr = f["n_decent_runs"].to_numpy(int) if merge_mode else None
+        fm = pyms.FeatureMap()
+        for i in range(len(f)):
+            ft = pyms.Feature(); ft.setMZ(float(mz[i])); ft.setRT(float(rt[i]))
+            a = float(area[i]) if np.isfinite(area[i]) and area[i] > 0 else 1.0
+            ft.setIntensity(a); ft.setUniqueId(j * _ALIGN_UID_BASE + i); fm.push_back(ft)
+        fm.updateRanges(); fmaps.append(fm)
+        meta.append({"mz": mz, "rt": rt, "area": area, "oq": oq, "ms2": ms2, "add": add, "nr": nr, "ndr": ndr})
+
+    cmap = pyms.ConsensusMap(); grouper = pyms.FeatureGroupingAlgorithmKD()
+    p = grouper.getParameters()
+    for key, val in [(b"warp:enabled", b"true" if warp else b"false"),
+                     (b"warp:rt_tol", float(max(rt_tol_s * 3, 60.0))), (b"warp:mz_tol", float(mz_tol_ppm)),
+                     (b"link:rt_tol", float(rt_tol_s)), (b"link:mz_tol", float(mz_tol_ppm)), (b"mz_unit", b"ppm")]:
+        try:
+            p.setValue(key, val)
+        except Exception:
+            pass
+    grouper.setParameters(p); grouper.group(fmaps, cmap)
+
+    rows, membership = [], []
+    for cf in cmap:
+        mzs = []; rts = []; areas = []; oqs = []; ms2s = []; adds = []; members = []
+        runs = set(); nrun_sum = ndec_sum = 0
+        for uid in (fh.getUniqueId() for fh in cf.getFeatureList()):
+            j, i = int(uid // _ALIGN_UID_BASE), int(uid % _ALIGN_UID_BASE)
+            if j >= len(meta) or i >= len(meta[j]["mz"]):
+                continue
+            runs.add(j); m = meta[j]
+            a = m["area"][i]; a = a if (np.isfinite(a) and a > 0) else 1.0
+            mzs.append(m["mz"][i]); rts.append(m["rt"][i]); areas.append(a)
+            oqs.append(int(m["oq"][i])); ms2s.append(bool(m["ms2"][i]))
+            if m["add"][i]:
+                adds.append(str(m["add"][i]))
+            members.append((j, i))
+            if merge_mode:
+                nrun_sum += int(m["nr"][i]); ndec_sum += int(m["ndr"][i])
+        if not mzs:
+            continue
+        areas = np.asarray(areas, float); w = areas / areas.sum()
+        rows.append({"source": "aligned", "mz_apex": float(np.dot(w, mzs)),
+                     "rt_apex_s": float(np.dot(w, rts)), "rt_start_s": float(min(rts)),
+                     "rt_end_s": float(max(rts)), "adduct": Counter(adds).most_common(1)[0][0] if adds else "",
+                     "has_ms2": any(ms2s), "overall_quality": int(max(oqs)), "area": float(areas.sum()),
+                     "n_runs": int(nrun_sum if merge_mode else len(runs)),
+                     "n_decent_runs": int(ndec_sum if merge_mode else sum(1 for q in oqs if q >= 3))})
+        membership.append(members)
+    df = pd.DataFrame(rows, columns=_ALIGN_COLS)
+    return (df, membership) if return_membership else df
+
+
+def _hierarchical_align(frames, chunk_size, mz_tol, rt_tol, log):
+    """align_runs, chunked + merged when len(frames) exceeds chunk_size.
+
+    Returns (consensus_df, membership) where membership[i] = original
+    (frame_idx, row_idx) members composed through both alignment levels.
+    """
+    n = len(frames)
+    if chunk_size <= 0 or n <= chunk_size:
+        return align_runs(frames, mz_tol, rt_tol, return_membership=True)
+    chunks = [list(range(k, min(k + chunk_size, n))) for k in range(0, n, chunk_size)]
+    log(f"  [chunk] {n} runs -> {len(chunks)} chunks of <={chunk_size}")
+    chunk_cons, chunk_mem = [], []
+    for ci, idxs in enumerate(chunks):
+        c, m = align_runs([frames[k] for k in idxs], mz_tol, rt_tol, return_membership=True)
+        chunk_mem.append([[(idxs[lj], row) for (lj, row) in mem] for mem in m]); chunk_cons.append(c)
+    merged, mem_m = align_runs(chunk_cons, mz_tol, rt_tol, return_membership=True)
+    global_mem = [[gm for (chk, crow) in members for gm in chunk_mem[chk][crow]] for members in mem_m]
+    return merged, global_mem
+
+
+def _align_file_block_key(f_handle, keys):
+    """File-level composite block value (polarity derived from per-spectrum data)."""
+    parts = []
+    for key in keys:
+        if key == "polarity":
+            if "positive polarity" in f_handle:
+                pol = np.asarray(f_handle["positive polarity"][:]).astype(bool)
+                parts.append("pos" if pol.all() else "neg" if (~pol).all() else "mixed")
+            else:
+                parts.append("NA")
+        else:
+            g = f_handle.get("features")
+            if g is not None and key in g.attrs:
+                parts.append(str(g.attrs[key]))
+            elif key in f_handle.attrs:
+                parts.append(str(f_handle.attrs[key]))
+            else:
+                parts.append("NA")
+    return "|".join(parts)
+
+
+def write_consensus_to_hdf5(files, frames, consensus, per_file_cid, log=print):
+    """Write consensus_id + consensus_n_runs into each /features and set alignment_quality."""
+    import h5py
+    n_runs = consensus["n_runs"].to_numpy(np.int32) if len(consensus) else np.zeros(0, np.int32)
+    for fidx, path in enumerate(files):
+        cid = per_file_cid[fidx]
+        feat_nruns = np.where(cid >= 0, n_runs[np.clip(cid, 0, None)], 0).astype(np.int32)
+        align_q = np.clip(feat_nruns, 0, 4).astype(np.int8)  # int8 0-4 reproducibility category
+        with h5py.File(path, "a") as f:
+            g = f.get("features")
+            if g is None:
+                continue
+            for name, data in (("consensus_id", cid.astype(np.int32)),
+                               ("consensus_n_runs", feat_nruns), ("alignment_quality", align_q)):
+                if name in g:
+                    del g[name]
+                g.create_dataset(name, data=data, compression="gzip", compression_opts=6)
+        log(f"  write-back {Path(path).name}: {int((cid >= 0).sum())}/{len(cid)} features -> consensus")
+
+
+def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 20.0,
+                       block_by: str = "polarity,acquisition_mode", chunk_size: int = 0,
+                       write_back: bool = True, prune_ms1_only: bool = False, log=print):
+    """Align per-file /features across one folder of HDF5s (e.g. one MSV deposit).
+
+    Groups files by ``block_by`` (comma-separated; 'polarity' is derived per file,
+    other keys read from attrs; 'none' disables), aligns each block (hierarchical
+    chunk+merge), then optionally writes consensus_id/n_runs back into each file and
+    prunes MS1-only features. consensus_id is folder-global (shared across files =
+    the same aligned feature). Returns the consensus DataFrame (with a 'block' column).
+    """
+    import glob as _glob
+    import h5py
+    if isinstance(hdf5_paths, (str, Path)):
+        p = Path(hdf5_paths)
+        paths = sorted(p.glob("*.hdf5")) if p.is_dir() else [Path(x) for x in _glob.glob(str(hdf5_paths))]
+    else:
+        paths = [Path(x) for x in hdf5_paths]
+    paths = [p for p in paths if "_merged" not in p.name]
+
+    files, frames = [], []
+    for p in sorted(paths):
+        fr = read_features_from_hdf5(p)
+        if fr is not None and len(fr):
+            files.append(str(p)); frames.append(fr)
+    if not frames:
+        log("[align_folder] no per-file /features found; nothing to align")
+        return pd.DataFrame(columns=_ALIGN_COLS + ["block"])
+    log(f"[align_folder] {len(frames)} files, {sum(len(f) for f in frames)} features")
+
+    keys = [k.strip() for k in str(block_by).split(",") if k.strip()] if block_by and str(block_by).lower() != "none" else None
+    if keys:
+        groups = {}
+        for i, p in enumerate(files):
+            with h5py.File(p, "r") as fh:
+                groups.setdefault(_align_file_block_key(fh, keys), []).append(i)
+        log(f"[align_folder block-by {'+'.join(keys)}] {len(groups)} blocks: "
+            + ", ".join(f"{k}={len(v)}" for k, v in sorted(groups.items())))
+        blocks = sorted(groups.items())
+    else:
+        blocks = [("all", list(range(len(frames))))]
+
+    per_file_cid = [np.full(len(fr), -1, dtype=np.int32) for fr in frames]
+    all_cons, cid_offset = [], 0
+    for block, idxs in blocks:
+        cons, mem = _hierarchical_align([frames[k] for k in idxs], chunk_size, mz_tol_ppm, rt_tol_s, log)
+        cons = cons.copy(); cons["block"] = block
+        for ci, members in enumerate(mem):
+            for (lidx, row) in members:
+                per_file_cid[idxs[lidx]][row] = cid_offset + ci
+        cid_offset += len(cons); all_cons.append(cons)
+    consensus = pd.concat(all_cons, ignore_index=True) if all_cons else pd.DataFrame(columns=_ALIGN_COLS + ["block"])
+    n2 = int((consensus["n_runs"] >= 2).sum()) if len(consensus) else 0
+    log(f"[align_folder] consensus={len(consensus)}  >=2 runs={n2}")
+
+    if write_back:
+        write_consensus_to_hdf5(files, frames, consensus, per_file_cid, log)
+    if prune_ms1_only:
+        tot_b = tot_d = 0
+        for path in files:
+            b, d = prune_features_without_ms2(path)
+            tot_b += b; tot_d += d
+        log(f"[align_folder prune] dropped {tot_d}/{tot_b} MS1-only features "
+            f"({100*tot_d/max(tot_b,1):.1f}%) across {len(files)} files")
+    return consensus
