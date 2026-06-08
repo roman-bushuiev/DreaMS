@@ -135,7 +135,15 @@ class DreaMS(pl.LightningModule):
         if self.ret_order_loss_w:
             self.ro_out = nn.Linear(2 * self.d_model, 1, bias=False)
 
-    def forward(self, spec, charge=None):
+    def enable_subformula_features(self, in_dim):
+        """Add a zero-initialized projection so per-peak subformula features can be injected as a
+        residual on the peak embeddings without perturbing a pretrained checkpoint at init."""
+        proj = nn.Linear(in_dim, self.d_peak)
+        nn.init.zeros_(proj.weight)
+        nn.init.zeros_(proj.bias)
+        self.subformula_proj = proj
+
+    def forward(self, spec, charge=None, subformula=None):
         """ Returns embeddings from the last Transformer encoder layer. """
 
         # Generate padding mask
@@ -150,6 +158,12 @@ class DreaMS(pl.LightningModule):
 
         # Lift peaks to d_peak (m/z's are normalized)
         peak_embs = self.ff_peak(self.__normalize_spec(spec))
+
+        # Optional per-peak subformula feature, added as a zero-initialized residual so a pretrained
+        # checkpoint is preserved at init (see enable_subformula_features).
+        sub_proj = getattr(self, 'subformula_proj', None)
+        if sub_proj is not None and subformula is not None:
+            peak_embs = peak_embs + sub_proj(subformula.to(peak_embs.dtype))
 
         # ms2prop variant
         # peak_embs = spec[:, :, 1].unsqueeze(-1)
