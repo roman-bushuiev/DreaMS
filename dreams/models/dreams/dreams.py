@@ -16,6 +16,39 @@ from dreams.definitions import NIST20, MONA
 from dreams.models.optimization.schedulers import NoamScheduler
 from dreams.models.dreams.layers import TransformerEncoder
 from dreams.models.optimization.losses_metrics import FocalLoss
+import math
+
+
+class MISTSubformulaEncoder(nn.Module):
+    """Per-peak subformula embedding in the MIST / MIST-CF style: element counts + Fourier features on
+    the (derived) formula mass + ring-double-bond equivalents (RDBE), through a 2-layer MLP. The final
+    layer is zero-initialised so the module is a no-op at start (a pretrained backbone is preserved).
+    Mass and RDBE are deterministic functions of the counts, so no extra inputs are required."""
+
+    # ELEMENTS order (matches dreams_mol.utils.subformula.ELEMENTS): C,H,N,O,P,S,F,Cl,Br,I
+    _MONO = [12.0, 1.0078250319, 14.0030740052, 15.9949146221, 30.97376151,
+             31.97207069, 18.99840322, 34.96885271, 78.9183376, 126.904473]
+    _VALDBE = [2., -1., 1., 0., 1., 0., -1., -1., -1., -1.]  # DBE = 1 + 0.5 * counts . valdbe
+
+    def __init__(self, in_dim, out_dim, hidden=256, n_freqs=16, zero_init=True):
+        super().__init__()
+        self.n_elem = len(self._MONO)
+        self.register_buffer("mono", torch.tensor(self._MONO))
+        self.register_buffer("valdbe", torch.tensor(self._VALDBE))
+        self.register_buffer("freqs", torch.exp(torch.linspace(
+            math.log(2 * math.pi / 1000.0), math.log(2 * math.pi / 0.05), n_freqs)))
+        self.mlp = nn.Sequential(nn.Linear(in_dim + 2 * n_freqs + 1, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, out_dim))
+        if zero_init:
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, subf):  # (..., in_dim) -> (..., out_dim)
+        counts = subf[..., :self.n_elem]
+        mass = (counts * self.mono).sum(-1, keepdim=True)
+        rdbe = 1.0 + 0.5 * (counts * self.valdbe).sum(-1, keepdim=True)
+        ang = mass * self.freqs
+        return self.mlp(torch.cat([subf, torch.sin(ang), torch.cos(ang), rdbe], dim=-1))
 
 
 class DreaMS(pl.LightningModule):
@@ -135,13 +168,30 @@ class DreaMS(pl.LightningModule):
         if self.ret_order_loss_w:
             self.ro_out = nn.Linear(2 * self.d_model, 1, bias=False)
 
-    def enable_subformula_features(self, in_dim):
-        """Add a zero-initialized projection so per-peak subformula features can be injected as a
-        residual on the peak embeddings without perturbing a pretrained checkpoint at init."""
-        proj = nn.Linear(in_dim, self.d_peak)
-        nn.init.zeros_(proj.weight)
-        nn.init.zeros_(proj.bias)
-        self.subformula_proj = proj
+    def enable_subformula_features(self, in_dim, fusion="linear", d_subf=64):
+        """Wire per-peak subformula features into the peak embeddings. `fusion`:
+          'linear'      — zero-init Linear residual into d_peak (original behaviour);
+          'mist_sum'    — MIST-style encoder (counts + Fourier(mass) + RDBE), zero-init, summed into d_peak;
+          'mist_concat' — MIST-style encoder (-> d_subf) concatenated with [peak, fourier] then projected
+                          back to d_model (projection init = [identity | 0]).
+        Every variant is a no-op at init, so a pretrained checkpoint is reproduced exactly."""
+        self.subformula_fusion = fusion
+        if fusion == "linear":
+            proj = nn.Linear(in_dim, self.d_peak)
+            nn.init.zeros_(proj.weight)
+            nn.init.zeros_(proj.bias)
+            self.subformula_proj = proj
+        elif fusion == "mist_sum":
+            self.subformula_enc = MISTSubformulaEncoder(in_dim, self.d_peak, zero_init=True)
+        elif fusion == "mist_concat":
+            self.subformula_enc = MISTSubformulaEncoder(in_dim, d_subf, zero_init=True)
+            fuse = nn.Linear(self.d_model + d_subf, self.d_model)
+            with torch.no_grad():
+                fuse.weight.zero_(); fuse.bias.zero_()
+                fuse.weight[:, :self.d_model].copy_(torch.eye(self.d_model))
+            self.subformula_fuse = fuse
+        else:
+            raise ValueError(f"Unknown subformula fusion: {fusion}")
 
     def forward(self, spec, charge=None, subformula=None):
         """ Returns embeddings from the last Transformer encoder layer. """
@@ -159,11 +209,12 @@ class DreaMS(pl.LightningModule):
         # Lift peaks to d_peak (m/z's are normalized)
         peak_embs = self.ff_peak(self.__normalize_spec(spec))
 
-        # Optional per-peak subformula feature, added as a zero-initialized residual so a pretrained
-        # checkpoint is preserved at init (see enable_subformula_features).
-        sub_proj = getattr(self, 'subformula_proj', None)
-        if sub_proj is not None and subformula is not None:
-            peak_embs = peak_embs + sub_proj(subformula.to(peak_embs.dtype))
+        # Optional per-peak subformula fusion (no-op at init; see enable_subformula_features).
+        fusion = getattr(self, "subformula_fusion", "linear" if hasattr(self, "subformula_proj") else None)
+        if subformula is not None and fusion in ("linear", "mist_sum"):
+            sub = subformula.to(peak_embs.dtype)
+            peak_embs = peak_embs + (self.subformula_proj(sub) if fusion == "linear"
+                                     else self.subformula_enc(sub))
 
         # ms2prop variant
         # peak_embs = spec[:, :, 1].unsqueeze(-1)
@@ -171,7 +222,11 @@ class DreaMS(pl.LightningModule):
         # Concatenate with fourier features (d_peak -> d_peak + d_fourier ("num_fourier_features" -> d_fourier))
         if self.d_fourier:
             fourier_features = self.ff_fourier(self.fourier_enc(spec[..., [0]]))
-            spec = torch.cat([peak_embs, fourier_features], dim=-1)
+            if subformula is not None and fusion == "mist_concat":
+                mist = self.subformula_enc(subformula.to(peak_embs.dtype))
+                spec = self.subformula_fuse(torch.cat([peak_embs, fourier_features, mist], dim=-1))
+            else:
+                spec = torch.cat([peak_embs, fourier_features], dim=-1)
         elif self.d_mz_token:
             tokenized_mzs = self.mz_tokenizer(
                 su.to_classes(spec[..., [0]], max_val=self.dformat.max_mz, bin_size=self.hot_mz_bin_size,
