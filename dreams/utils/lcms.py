@@ -486,7 +486,9 @@ class QualityCategory(Enum):
 # (<Separation>-<Ionization>-<Analyzer>, e.g. LC-ESI-QTOF / LC-ESI-ITFT / LC-ESI-QQ).
 INSTRUMENT_FAMILIES = {
     "orbitrap": {
-        "ppm_default": 5.0,
+        # 10 ppm (not 5): tolerant of older / poorly-calibrated instruments that
+        # dominate public repositories, with no measured cost on well-calibrated ones.
+        "ppm_default": 10.0,
         "skip": None,
         "keywords": [
             "orbitrap", "exactive", "exploris", "fusion", "tribrid",
@@ -499,12 +501,13 @@ INSTRUMENT_FAMILIES = {
         ],
     },
     "fticr": {
-        "ppm_default": 5.0,
+        "ppm_default": 10.0,
         "skip": None,
         "keywords": ["fticr", "ft-icr", "ft icr", "solarix", "scimax"],
     },
     "qtof": {
-        "ppm_default": 15.0,
+        # 20 ppm (not 15): same robustness margin for ToF calibration drift.
+        "ppm_default": 20.0,
         "skip": None,
         "keywords": [
             "qtof", "q-tof", "q tof", "qtfo", "ttof", "tripletof", "triple tof",
@@ -2327,7 +2330,7 @@ def assign_adducts_by_network(features_df: pd.DataFrame, polarity: str,
                               mz_tol_ppm: float = 10.0,
                               rt_tol_s: float = 5.0,
                               ms1_exp=None,
-                              min_shape_corr: float = 0.85,
+                              min_shape_corr: float = 0.90,
                               eic_pad_s: float = 2.0):
     """Ion-identity adduct / in-source-fragment assignment (IIMN-style).
 
@@ -2336,7 +2339,10 @@ def assign_adducts_by_network(features_df: pd.DataFrame, polarity: str,
     in-source fragment, 2M dimer) of the SAME neutral mass and look for a
     co-eluting feature at that m/z. A predicted partner is only accepted when
     its **chromatographic peak shape correlates** with the base feature's EIC
-    (Pearson r over the shared scan grid >= ``min_shape_corr``). This peak-shape
+    (Pearson r over the shared scan grid >= ``min_shape_corr``). The default
+    0.90 (not 0.85) bounds the apex offset two grouped peaks may have: for
+    Gaussian elution profiles r=0.90 corresponds to ~0.55 s apex shift vs ~0.69 s
+    at 0.85 (raise to 0.95 → ~0.39 s for stricter co-elution). This peak-shape
     gate is the data-driven evidence behind Schmid et al. 2021 IIMN and SIRIUS's
     ``detectedAdducts``: random co-eluting m/z pairs match an adduct delta by
     chance in dense feature space, but only ions of the *same* compound rise and
@@ -2458,7 +2464,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
                                 method: str = "openms_dreams",
                                 tol_mz_ppm: Optional[float] = None,
                                 noise_quantile: float = 0.05,
-                                adduct_min_shape_corr: float = 0.85):
+                                adduct_min_shape_corr: float = 0.90):
     """OpenMS feature detection returning the SIRIUS 4-tuple schema.
 
     ``method`` is one of :data:`OPENMS_METHODS`:
