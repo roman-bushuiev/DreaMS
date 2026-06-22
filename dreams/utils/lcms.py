@@ -2981,10 +2981,169 @@ def write_consensus_to_hdf5(files, frames, consensus, per_file_cid, log=print):
         log(f"  write-back {Path(path).name}: {int((cid >= 0).sum())}/{len(cid)} features -> consensus")
 
 
+def _greedy_modified_cosine(mz1, in1, mz2, in2, frag_tol_mz: float = 0.02):
+    """matchms-style greedy (modified) cosine of two peak lists -> (score, n_matched).
+
+    Precursor-aligned features share m/z, so the mass-shift term is 0 and this reduces
+    to the standard greedy cosine: candidate peak pairs within ``frag_tol_mz`` are taken
+    greedily by descending intensity product (each peak used once); score is the
+    intensity-weighted overlap normalised to [0, 1] (matchms ``intensity_power=1``).
+    """
+    if len(mz1) == 0 or len(mz2) == 0:
+        return 0.0, 0
+    o1 = np.argsort(mz1); mz1, in1 = np.asarray(mz1)[o1], np.asarray(in1)[o1]
+    o2 = np.argsort(mz2); mz2, in2 = np.asarray(mz2)[o2], np.asarray(in2)[o2]
+    pairs = []
+    for i in range(len(mz1)):
+        lo = int(np.searchsorted(mz2, mz1[i] - frag_tol_mz))
+        hi = int(np.searchsorted(mz2, mz1[i] + frag_tol_mz))
+        for j in range(lo, hi):
+            pairs.append((in1[i] * in2[j], i, j))
+    if not pairs:
+        return 0.0, 0
+    pairs.sort(reverse=True)
+    used1, used2 = set(), set()
+    overlap = 0.0; n_matched = 0
+    for prod, i, j in pairs:
+        if i in used1 or j in used2:
+            continue
+        used1.add(i); used2.add(j); overlap += prod; n_matched += 1
+    denom = float(np.sqrt((in1 ** 2).sum() * (in2 ** 2).sum()))
+    return (overlap / denom if denom > 0 else 0.0), n_matched
+
+
+def _representative_ms2_per_feature(hdf5_path, group_name: str = "features",
+                                    fk_dataset_name: str = "feature_id"):
+    """Best (most intense) linked MS2 spectrum per feature -> {feature_row: (mz, intensity)}.
+
+    The feature row index == feature_id (per-file /features is written 0..n-1), so the
+    keys line up with the canonical feature-frame row index used in alignment.
+    """
+    import h5py
+    out = {}
+    with h5py.File(hdf5_path, "r") as f:
+        if fk_dataset_name not in f or "spectrum" not in f or group_name not in f:
+            return out
+        fids = np.asarray(f[fk_dataset_name][:], dtype=int)
+        linked = np.nonzero(fids >= 0)[0]
+        if linked.size == 0:
+            return out
+        spec = f["spectrum"][:]  # (n_ms2, 2, P), zero-padded
+    for ms2_row in linked:
+        row = spec[ms2_row]
+        mz = np.asarray(row[0], float); inten = np.asarray(row[1], float)
+        keep = (mz > 0) & (inten > 0)
+        mz, inten = mz[keep], inten[keep]
+        if mz.size == 0:
+            continue
+        fid = int(fids[ms2_row]); tot = float(inten.sum())
+        prev = out.get(fid)
+        if prev is None or tot > prev[2]:
+            out[fid] = (mz, inten, tot)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def _consensus_row_from_members(members, frames):
+    """Aggregate per-file member features into one consensus row (non-merge mode),
+    matching align_runs' aggregation (area-weighted m/z & RT, summed area, max quality)."""
+    mzs, rts, areas, oqs, ms2s, adds, runs = [], [], [], [], [], [], set()
+    for (fi, row) in members:
+        r = frames[fi].iloc[row]
+        a = float(r["area"]); a = a if (np.isfinite(a) and a > 0) else 1.0
+        mzs.append(float(r["mz_apex"])); rts.append(float(r["rt_apex_s"])); areas.append(a)
+        oqs.append(int(r["overall_quality"])); ms2s.append(bool(r["has_ms2"]))
+        if r["adduct"]:
+            adds.append(str(r["adduct"]))
+        runs.add(fi)
+    areas = np.asarray(areas, float); w = areas / areas.sum()
+    return {"source": "aligned", "mz_apex": float(np.dot(w, mzs)), "rt_apex_s": float(np.dot(w, rts)),
+            "rt_start_s": float(min(rts)), "rt_end_s": float(max(rts)),
+            "adduct": Counter(adds).most_common(1)[0][0] if adds else "",
+            "has_ms2": any(ms2s), "overall_quality": int(max(oqs)), "area": float(areas.sum()),
+            "n_runs": len(runs), "n_decent_runs": int(sum(1 for q in oqs if q >= 3))}
+
+
+def ms2_aware_consensus_split(files, frames, consensus, per_file_cid, *,
+                              min_cosine: float = 0.7, frag_tol_mz: float = 0.02,
+                              min_matched_peaks: int = 4, min_peaks: int = 5, log=print):
+    """Split consensus features that wrongly merge distinct co-eluting compounds.
+
+    After m/z+RT grouping, any consensus grouping >=2 MS2-bearing features whose
+    representative MS2 spectra fall into more than one 'same-compound' cluster
+    (modified-cosine >= ``min_cosine`` with >= ``min_matched_peaks`` shared peaks, both
+    spectra >= ``min_peaks`` peaks) is split into those clusters. Standard GNPS
+    molecular-networking defaults (cosine 0.7, 0.02 Da). Conservative: a feature is only
+    moved out on positive MS2 evidence of difference; features with no comparable MS2 stay
+    with the largest cluster, so this can only *raise* precision, never merge more.
+    Returns (consensus_df, per_file_cid) with consensus row position == consensus_id.
+    """
+    if not len(consensus):
+        return consensus, per_file_cid
+    rep = [_representative_ms2_per_feature(p) for p in files]
+    if not any(rep):
+        log("[ms2-split] no MS2 linked to features; skipped")
+        return consensus, per_file_cid
+
+    cid_members = {}
+    for fi, cids in enumerate(per_file_cid):
+        for row, c in enumerate(cids.tolist()):
+            if c >= 0:
+                cid_members.setdefault(int(c), []).append((fi, row))
+
+    rows = consensus.to_dict("records")  # position == cid
+    n_cons_split = n_extra = 0
+    for cid, members in cid_members.items():
+        ms2_members = [(fi, row) for (fi, row) in members
+                       if row in rep[fi] and len(rep[fi][row][0]) >= min_peaks]
+        if len(ms2_members) < 2:
+            continue
+        n = len(ms2_members); parent = list(range(n))
+
+        def find(x):
+            r = x
+            while parent[r] != r:
+                r = parent[r]
+            while parent[x] != r:
+                parent[x], x = r, parent[x]
+            return r
+
+        for a in range(n):
+            mz_a, in_a = rep[ms2_members[a][0]][ms2_members[a][1]]
+            for b in range(a + 1, n):
+                mz_b, in_b = rep[ms2_members[b][0]][ms2_members[b][1]]
+                sc, nm = _greedy_modified_cosine(mz_a, in_a, mz_b, in_b, frag_tol_mz)
+                if sc >= min_cosine and nm >= min_matched_peaks:
+                    parent[find(a)] = find(b)
+        comps = {}
+        for k in range(n):
+            comps.setdefault(find(k), []).append(ms2_members[k])
+        if len(comps) < 2:
+            continue
+        comp_list = sorted(comps.values(), key=len, reverse=True)
+        ms2_set = set(ms2_members)
+        non_ms2 = [m for m in members if m not in ms2_set]  # stay with the largest cluster
+        block = rows[cid].get("block", "")
+        keep_grp = comp_list[0] + non_ms2
+        rows[cid] = {**_consensus_row_from_members(keep_grp, frames), "block": block}
+        for (fi, row) in keep_grp:
+            per_file_cid[fi][row] = cid
+        for grp in comp_list[1:]:
+            new_cid = len(rows)
+            rows.append({**_consensus_row_from_members(grp, frames), "block": block})
+            for (fi, row) in grp:
+                per_file_cid[fi][row] = new_cid
+        n_cons_split += 1; n_extra += len(comp_list) - 1
+    log(f"[ms2-split] split {n_cons_split} consensus on MS2 disagreement "
+        f"(modified-cosine < {min_cosine}) -> +{n_extra} consensus features")
+    return pd.DataFrame(rows), per_file_cid
+
+
 def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 20.0,
                        block_by: str = "polarity,acquisition_mode", chunk_size: int = 0,
                        write_back: bool = True, prune_ms1_only: bool = False,
-                       warp="auto", warp_min_runs: int = 50, log=print):
+                       warp="auto", warp_min_runs: int = 50,
+                       ms2_aware: bool = True, ms2_min_cosine: float = 0.7,
+                       ms2_frag_tol_mz: float = 0.02, log=print):
     """Align per-file /features across one folder of HDF5s (e.g. one MSV deposit).
 
     Groups files by ``block_by`` (comma-separated; 'polarity' is derived per file,
@@ -3003,6 +3162,12 @@ def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 2
         shift is not a regime where cross-sample statistical interpretation is safe
         anyway — rerun rather than warp.)
       * ``True`` / ``False`` — force the warp on / off for every block.
+
+    ``ms2_aware`` (default True): after m/z+RT grouping, split any consensus that merges
+    features whose linked MS2 spectra disagree (modified-cosine < ``ms2_min_cosine``,
+    ``ms2_frag_tol_mz`` Da) — protects natural-product data where finite LC separation
+    leaves distinct compounds at ~the same m/z and RT, distinguishable only by MS2.
+    See :func:`ms2_aware_consensus_split`.
     """
     import glob as _glob
     import h5py
@@ -3051,6 +3216,11 @@ def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 2
     consensus = pd.concat(all_cons, ignore_index=True) if all_cons else pd.DataFrame(columns=_ALIGN_COLS + ["block"])
     n2 = int((consensus["n_runs"] >= 2).sum()) if len(consensus) else 0
     log(f"[align_folder] consensus={len(consensus)}  >=2 runs={n2}")
+
+    if ms2_aware and len(consensus):
+        consensus, per_file_cid = ms2_aware_consensus_split(
+            files, frames, consensus, per_file_cid,
+            min_cosine=ms2_min_cosine, frag_tol_mz=ms2_frag_tol_mz, log=log)
 
     if write_back:
         write_consensus_to_hdf5(files, frames, consensus, per_file_cid, log)
