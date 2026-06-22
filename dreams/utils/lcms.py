@@ -2920,7 +2920,7 @@ def align_runs(frames: list, mz_tol_ppm: float = 10.0, rt_tol_s: float = 20.0,
     return (df, membership) if return_membership else df
 
 
-def _hierarchical_align(frames, chunk_size, mz_tol, rt_tol, log):
+def _hierarchical_align(frames, chunk_size, mz_tol, rt_tol, log, warp: bool = True):
     """align_runs, chunked + merged when len(frames) exceeds chunk_size.
 
     Returns (consensus_df, membership) where membership[i] = original
@@ -2928,14 +2928,14 @@ def _hierarchical_align(frames, chunk_size, mz_tol, rt_tol, log):
     """
     n = len(frames)
     if chunk_size <= 0 or n <= chunk_size:
-        return align_runs(frames, mz_tol, rt_tol, return_membership=True)
+        return align_runs(frames, mz_tol, rt_tol, warp=warp, return_membership=True)
     chunks = [list(range(k, min(k + chunk_size, n))) for k in range(0, n, chunk_size)]
     log(f"  [chunk] {n} runs -> {len(chunks)} chunks of <={chunk_size}")
     chunk_cons, chunk_mem = [], []
     for ci, idxs in enumerate(chunks):
-        c, m = align_runs([frames[k] for k in idxs], mz_tol, rt_tol, return_membership=True)
+        c, m = align_runs([frames[k] for k in idxs], mz_tol, rt_tol, warp=warp, return_membership=True)
         chunk_mem.append([[(idxs[lj], row) for (lj, row) in mem] for mem in m]); chunk_cons.append(c)
-    merged, mem_m = align_runs(chunk_cons, mz_tol, rt_tol, return_membership=True)
+    merged, mem_m = align_runs(chunk_cons, mz_tol, rt_tol, warp=warp, return_membership=True)
     global_mem = [[gm for (chk, crow) in members for gm in chunk_mem[chk][crow]] for members in mem_m]
     return merged, global_mem
 
@@ -2983,7 +2983,8 @@ def write_consensus_to_hdf5(files, frames, consensus, per_file_cid, log=print):
 
 def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 20.0,
                        block_by: str = "polarity,acquisition_mode", chunk_size: int = 0,
-                       write_back: bool = True, prune_ms1_only: bool = False, log=print):
+                       write_back: bool = True, prune_ms1_only: bool = False,
+                       warp="auto", warp_min_runs: int = 50, log=print):
     """Align per-file /features across one folder of HDF5s (e.g. one MSV deposit).
 
     Groups files by ``block_by`` (comma-separated; 'polarity' is derived per file,
@@ -2991,6 +2992,17 @@ def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 2
     chunk+merge), then optionally writes consensus_id/n_runs back into each file and
     prunes MS1-only features. consensus_id is folder-global (shared across files =
     the same aligned feature). Returns the consensus DataFrame (with a 'block' column).
+
+    ``warp`` controls the LOWESS RT-warp inside FeatureGroupingAlgorithmKD:
+      * ``"auto"`` (default) — enable the warp only for blocks with
+        ``>= warp_min_runs`` files. The sophisticated warp helps large, homogeneous
+        cohorts (statistical metabolomics) where retention genuinely drifts across
+        many injections, but tends to *over-merge* on small, heterogeneous sample
+        collections (e.g. natural-product surveys). Below the threshold the simpler
+        unwarped KD join (≈ MZmine's Join aligner) is used. (<50 runs with real RT
+        shift is not a regime where cross-sample statistical interpretation is safe
+        anyway — rerun rather than warp.)
+      * ``True`` / ``False`` — force the warp on / off for every block.
     """
     import glob as _glob
     import h5py
@@ -3026,7 +3038,11 @@ def align_folder_hdf5s(hdf5_paths, mz_tol_ppm: float = 10.0, rt_tol_s: float = 2
     per_file_cid = [np.full(len(fr), -1, dtype=np.int32) for fr in frames]
     all_cons, cid_offset = [], 0
     for block, idxs in blocks:
-        cons, mem = _hierarchical_align([frames[k] for k in idxs], chunk_size, mz_tol_ppm, rt_tol_s, log)
+        warp_block = warp if isinstance(warp, bool) else (len(idxs) >= warp_min_runs)
+        log(f"  [block {block}] {len(idxs)} runs, RT-warp {'ON' if warp_block else 'OFF'}"
+            + ("" if isinstance(warp, bool) else f" (auto: {'>=' if warp_block else '<'} {warp_min_runs})"))
+        cons, mem = _hierarchical_align([frames[k] for k in idxs], chunk_size,
+                                        mz_tol_ppm, rt_tol_s, log, warp=warp_block)
         cons = cons.copy(); cons["block"] = block
         for ci, members in enumerate(mem):
             for (lidx, row) in members:
