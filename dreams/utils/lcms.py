@@ -2201,6 +2201,10 @@ def prune_features_without_ms2(hdf5_pth, group_name: str = "features",
 # (parse_adduct_mass_shift / assign_compound_ids_by_adduct).
 # ---------------------------------------------------------------------------
 
+# Scan modes that are not mass spectra: UV/PDA and other optical detectors. A deny-list, so an
+# unrecognised mode is kept rather than silently dropped.
+NON_MS_SCAN_MODES = (pyms.ScanMode.EMR, pyms.ScanMode.EMISSION, pyms.ScanMode.ABSORPTION)
+
 OPENMS_METHODS = ("openms_vanilla", "openms_dreams")
 
 # Per-polarity adduct vocabulary for the enhanced arm's ion-identity network.
@@ -2546,7 +2550,14 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     ms1_intensities = []
     ms2_prec_mz, ms2_prec_rt, ms2_intensities = [], [], []
     polarity = None
+    n_non_ms = 0
     for s in exp:
+        # UV/PDA channels carry no ms-level term and OpenMS defaults a missing level to 1, so they
+        # would land in ms1, set polarity (getPolarity() gives 0, not None) and break mass-trace
+        # continuity -- a run with a UV channel yields no features at all.
+        if s.getInstrumentSettings().getScanMode() in NON_MS_SCAN_MODES:
+            n_non_ms += 1
+            continue
         if polarity is None:
             try:
                 polarity = s.getInstrumentSettings().getPolarity()
@@ -2571,8 +2582,11 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
                 ms2_intensities.append(ms2_int)
     ms1.sortSpectra(True)
     ms1.updateRanges()
+    attrs["n_non_ms_spectra"] = n_non_ms
     if ms1.getNrSpectra() == 0:
         return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": "no_ms1_spectra"}
+    if ms1.getNrSpectra() < 3:   # MassTraceDetection raises below 3 MS1 spectra
+        return pd.DataFrame(), [], attrs, {"ok": True, "skip_reason": "no_features_detected"}
     polarity_str = "neg" if polarity == 2 else "pos"
     attrs["polarity"] = polarity_str
 
