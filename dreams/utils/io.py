@@ -625,6 +625,9 @@ def read_mzml(
     sirius_tol_rt_s: float = 5.0,
     sirius_workspace: Optional[Union[Path, str]] = None,
     sirius_rest_url: Optional[str] = None,
+    eb_binary: Optional[Union[Path, str]] = None,
+    eb_quant_method: str = "peak_height",
+    eb_threads: Optional[int] = None,
 ):
     """
     Read MS2 spectra from an .mzML or .mzXML file into a DataFrame, and optionally
@@ -659,13 +662,17 @@ def read_mzml(
         feature_method: Which detector to use. Defaults to ``"openms_dreams"`` — the
             pure-CPU OpenMS-DreaMS detector (data-driven noise floor, SIRIUS-style
             quality categories, ion-identity adducts), no JVM / auth / server. Other
-            values: ``"openms_vanilla"`` (stock pyOpenMS baseline), or ``"sirius"`` to
-            route through SIRIUS (subprocess, or REST when ``sirius_rest_url`` is set).
-            All detectors write the same ``/features`` schema.
+            values: ``"openms_vanilla"`` (stock pyOpenMS baseline), ``"everything_bagel"``
+            (external Everything Bagel Rust binary; see ``eb_*`` options), or
+            ``"sirius"`` to route through SIRIUS (subprocess, or REST when
+            ``sirius_rest_url`` is set). All detectors write the same ``/features`` schema.
         sirius_workdir: Working directory for feature detection (reused by every
-            method; defaults to ``<output_path>/../sirius_work``).
+            method; defaults to ``<output_path>/../feature_work``).
         sirius_port / sirius_workspace / sirius_rest_url: SIRIUS-only options
-            (ignored by the OpenMS methods).
+            (ignored by the OpenMS and Everything Bagel methods).
+        eb_binary / eb_quant_method / eb_threads: Everything Bagel options (used
+            only when ``feature_method="everything_bagel"``); ``eb_binary`` defaults
+            to ``$DREAMSMOL_EB_BIN``.
         sirius_tol_mz_ppm / sirius_tol_rt_s: m/z (ppm) and RT (s) tolerances for
             linking MS2 spectra to features; m/z defaults to the instrument-resolved
             value when None.
@@ -940,37 +947,46 @@ def read_mzml(
             logger=logger,
         )
 
-        # Optional: run SIRIUS lcms-align and attach a /features group + root
-        # /feature_id FK column to the just-written HDF5. Failures are logged
-        # but do NOT invalidate the MS2-only HDF5 — downstream code can simply
-        # use it as if compute_features=False.
+        # Optional: run LC-MS feature detection and attach a /features group +
+        # root /feature_id FK column to the just-written HDF5. Failures are
+        # logged but do NOT invalidate the MS2-only HDF5 — downstream code can
+        # simply use it as if compute_features=False.
         if compute_features:
             try:
                 from dreams.utils.lcms import (
                     compute_features_for_mzml, compute_features_via_rest,
                     compute_features_via_openms, OPENMS_METHODS,
+                    compute_features_via_everything_bagel, EB_METHODS,
                     attach_features_group, link_ms2_to_features,
                 )
-                _sirius_workdir = (
+                _feature_workdir = (
                     Path(sirius_workdir) if sirius_workdir is not None
-                    else Path(output_path).parent / "sirius_work"
+                    else Path(output_path).parent / "feature_work"
                 )
-                _sirius_workdir.mkdir(parents=True, exist_ok=True)
+                _feature_workdir.mkdir(parents=True, exist_ok=True)
                 if feature_method in OPENMS_METHODS:
                     # Pure-CPU OpenMS path: no JVM, no auth, no persistent server.
                     feats_df, isotope_patterns, attrs, status = compute_features_via_openms(
-                        pth, _sirius_workdir, method=feature_method,
+                        pth, _feature_workdir, method=feature_method,
                         tol_mz_ppm=sirius_tol_mz_ppm,
+                    )
+                elif feature_method in EB_METHODS:
+                    # External Everything Bagel Rust binary (aligned mode); adducts
+                    # + isotopes + ISF come from its cross-file merge stage.
+                    feats_df, isotope_patterns, attrs, status = compute_features_via_everything_bagel(
+                        pth, _feature_workdir, method=feature_method,
+                        tol_mz_ppm=sirius_tol_mz_ppm, eb_binary=eb_binary,
+                        quant_method=eb_quant_method, threads=eb_threads,
                     )
                 elif sirius_rest_url:
                     # Persistent-server path: all SIRIUS work runs inside one
                     # already-authenticated server over HTTP (no per-file auth).
                     feats_df, isotope_patterns, attrs, status = compute_features_via_rest(
-                        pth, sirius_rest_url, _sirius_workdir,
+                        pth, sirius_rest_url, _feature_workdir,
                     )
                 else:
                     feats_df, isotope_patterns, attrs, status = compute_features_for_mzml(
-                        pth, _sirius_workdir,
+                        pth, _feature_workdir,
                         sirius_port=sirius_port,
                         keep_project=False,
                         sirius_workspace=sirius_workspace,
@@ -1009,14 +1025,14 @@ def read_mzml(
                         f"tol_ppm={resolved_tol_ppm}, status={status})"
                     )
             except Exception as e:
-                # SIRIUS failures must not corrupt the MS2-only HDF5.
+                # Feature-detection failures must not corrupt the MS2-only HDF5.
                 import traceback
                 tb = traceback.format_exc()
                 if logger:
-                    logger.error(f"SIRIUS feature attachment failed: {e}\n{tb}")
+                    logger.error(f"Feature attachment failed: {e}\n{tb}")
                 else:
                     sys.stderr.write(
-                        f"SIRIUS feature attachment failed for {pth}: {e}\n{tb}\n")
+                        f"Feature attachment failed for {pth}: {e}\n{tb}\n")
 
     return df
 

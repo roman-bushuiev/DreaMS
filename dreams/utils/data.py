@@ -510,6 +510,9 @@ class MSData:
         feature_workdir: Optional[Union[Path, str]] = None,
         tol_mz_ppm: Optional[float] = None,
         tol_rt_s: float = 5.0,
+        eb_binary: Optional[Union[Path, str]] = None,
+        eb_quant_method: str = 'peak_height',
+        eb_threads: Optional[int] = None,
         n_highest_peaks: int = 128,
         in_mem: bool = False,
         **kwargs
@@ -530,6 +533,7 @@ class MSData:
                 store_extra=True, compute_features=True, feature_method=feature_method,
                 n_highest_peaks=n_highest_peaks, sirius_workdir=feature_workdir,
                 sirius_tol_mz_ppm=tol_mz_ppm, sirius_tol_rt_s=tol_rt_s,
+                eb_binary=eb_binary, eb_quant_method=eb_quant_method, eb_threads=eb_threads,
             )
             return MSData(hdf5_pth, in_mem=in_mem, features_group='features',
                           features_fk='feature_id', **kwargs)

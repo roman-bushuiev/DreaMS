@@ -2206,6 +2206,7 @@ def prune_features_without_ms2(hdf5_pth, group_name: str = "features",
 NON_MS_SCAN_MODES = (pyms.ScanMode.EMR, pyms.ScanMode.EMISSION, pyms.ScanMode.ABSORPTION)
 
 OPENMS_METHODS = ("openms_vanilla", "openms_dreams")
+EB_METHODS = ("everything_bagel",)  # Ming Wang's Scalable_FeatureFinder_Rust (external binary)
 
 # Per-polarity adduct vocabulary for the enhanced arm's ion-identity network.
 # primary = base ionization; alternatives = co-eluting ion forms / in-source
@@ -2783,6 +2784,181 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
               "ms2_quality", "adduct_quality", "overall_quality"):
         df[q] = df[q].astype(np.int8)
 
+    return df, isotope_patterns, attrs, {"ok": True, "skip_reason": ""}
+
+
+EB_ADDUCT_CANON = {
+    # Everything Bagel writes an explicit unit charge count ("]1+"); map its
+    # forms to the convention the OpenMS-DreaMS path stores in /features/adduct
+    # so the same downstream adduct policy applies with no change.
+    "[M+H]1+": "[M+H]+",
+    "[M+Na]1+": "[M+Na]+",
+    "[M+K]1+": "[M+K]+",
+    "[M+NH3+H]1+": "[M+NH4]+",
+    "[M-H2O+H]1+": "[M+H-H2O]+",
+    "[M-2H2O+H]1+": "[M+H-2H2O]+",
+    "[2M+H]1+": "[2M+H]+",
+    "[2M+Na]1+": "[2M+Na]+",
+    "[M-H]1-": "[M-H]-",
+    "[M-H2O-H]1-": "[M-H-H2O]-",
+    "[M+Cl]1-": "[M+Cl]-",
+    "[M+HCOO]1-": "[M+CHO2]-",
+    "[2M-H]1-": "[2M-H]-",
+}
+
+
+def _eb_adduct_to_canon(s: str) -> str:
+    """Map an Everything Bagel adduct string (e.g. ``"[M+H]1+"``) to the adduct
+    convention stored by the OpenMS path (e.g. ``"[M+H]+"``). Known forms map
+    exactly; any other form just drops a redundant unit charge count
+    (``"]1+"`` -> ``"]+"``), leaving multiply-charged forms (``"]2+"``) intact."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if s in EB_ADDUCT_CANON:
+        return EB_ADDUCT_CANON[s]
+    return re.sub(r"\]1([+-])$", r"]\1", s)
+
+
+def compute_features_via_everything_bagel(
+    mzml_pth, work_dir=None, method: str = "everything_bagel",
+    tol_mz_ppm: Optional[float] = None, eb_binary=None,
+    quant_method: str = "peak_height", threads: Optional[int] = None,
+):
+    """Everything Bagel (Ming Wang, ``Scalable_FeatureFinder_Rust``) feature
+    detection, returning the same ``(features_df, isotope_patterns, attrs,
+    status)`` 4-tuple as :func:`compute_features_via_openms` so the shared
+    :func:`link_ms2_to_features` + :func:`attach_features_group` path applies
+    unchanged.
+
+    The external Rust binary is run in ALIGNED mode (not ``--no-align``): a single
+    file's cross-file merge stage is what populates adducts / isotopes / in-source
+    fragments — ``--no-align`` yields none. Feature m/z, RT window and adduct come
+    from ``aligned_features.csv`` + ``aligned_rt_bounds.csv`` (RT is minutes in EB
+    and converted to seconds here). EB owns feature detection + adduct annotation
+    only; MS2->feature linkage and the representative-MS2 pick stay with DreaMS
+    downstream, identical to the native path. The binary path resolves from
+    ``eb_binary`` or ``$DREAMSMOL_EB_BIN``.
+    """
+    mzml_pth = Path(mzml_pth)
+    eb_binary = (Path(eb_binary) if eb_binary
+                 else Path(os.environ["DREAMSMOL_EB_BIN"]) if os.environ.get("DREAMSMOL_EB_BIN")
+                 else None)
+
+    instrument_name = get_instrument_name(mzml_pth)
+    instrument_family = classify_instrument_family(instrument_name)
+    attrs = {
+        "feature_method": method,
+        "eb_binary": str(eb_binary) if eb_binary else "",
+        "lcms_align_args": "",
+        "acquisition_mode": "UNKNOWN",
+        "instrument_name": instrument_name,
+        "instrument_family": instrument_family,
+        "auto_tol_mz_ppm": INSTRUMENT_FAMILIES[instrument_family]["ppm_default"],
+    }
+    if eb_binary is None or not eb_binary.exists():
+        return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": "eb_binary_not_found"}
+    skip_reason = INSTRUMENT_FAMILIES[instrument_family].get("skip")
+    if skip_reason:
+        return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": skip_reason}
+
+    work_dir = Path(work_dir) if work_dir else mzml_pth.parent / "eb_work"
+    eb_out = Path(work_dir) / "eb_out"
+    eb_out.mkdir(parents=True, exist_ok=True)
+    cmd = [str(eb_binary), str(mzml_pth), "--output", str(eb_out),
+           "--quant-method", quant_method]
+    if tol_mz_ppm is not None:
+        cmd += ["--mz-tol-ppm", str(float(tol_mz_ppm))]
+    if threads is not None:
+        cmd += ["--threads", str(int(threads))]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        attrs["eb_stderr_tail"] = (proc.stderr or "")[-500:]
+        return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": f"eb_rc_{proc.returncode}"}
+
+    feats_csv = eb_out / "aligned_features.csv"
+    if not feats_csv.exists():
+        return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": "eb_no_output"}
+    fdf = pd.read_csv(feats_csv)
+    n = len(fdf)
+    if n == 0:
+        return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": "eb_empty"}
+
+    # Polarity + centroid from EB's file_metadata.tsv (no redundant mzML parse).
+    polarity = "pos"
+    meta_pth = eb_out / "file_metadata.tsv"
+    if meta_pth.exists():
+        try:
+            meta = pd.read_csv(meta_pth, sep="\t")
+            polarity = "neg" if str(meta.iloc[0].get("polarity", "")).lower().startswith("neg") else "pos"
+            attrs["acquisition_mode"] = (
+                AcquisitionMode.DDA_CENTROID.value
+                if str(meta.iloc[0].get("centroided", "")).lower() == "true"
+                else AcquisitionMode.DDA_PROFILE.value)
+        except Exception:
+            pass
+    attrs["polarity"] = polarity
+    sign = 1 if polarity == "pos" else -1
+
+    # RT window bounds (minutes) keyed by row ID; fall back to the apex if absent.
+    bounds = {}
+    rb = eb_out / "aligned_rt_bounds.csv"
+    if rb.exists():
+        rbd = pd.read_csv(rb)
+        for _, r in rbd.iterrows():
+            bounds[int(r["row ID"])] = (float(r["row RT start"]), float(r["row RT end"]))
+
+    fid = fdf["row ID"].astype(int).to_numpy()
+    mz = fdf["row m/z"].astype(float).to_numpy()
+    rt_apex_min = fdf["row retention time"].astype(float).to_numpy()
+    rt_lo = np.array([bounds.get(int(f), (rt_apex_min[i], rt_apex_min[i]))[0]
+                      for i, f in enumerate(fid)], dtype=float)
+    rt_hi = np.array([bounds.get(int(f), (rt_apex_min[i], rt_apex_min[i]))[1]
+                      for i, f in enumerate(fid)], dtype=float)
+    charge = (fdf["charge"].fillna(1).astype(int).clip(lower=1).to_numpy()
+              if "charge" in fdf.columns else np.ones(n, dtype=int))
+    adduct = [_eb_adduct_to_canon(a) for a in
+              (fdf["adduct"].fillna("").astype(str).tolist()
+               if "adduct" in fdf.columns else [""] * n)]
+    has_ms2 = (fdf["has_ms2"].astype(str).str.lower().eq("true").to_numpy()
+               if "has_ms2" in fdf.columns else np.zeros(n, dtype=bool))
+    compound = (fdf["feature_group"].fillna("").astype(str).tolist()
+                if "feature_group" in fdf.columns else [""] * n)
+    area_cols = [c for c in fdf.columns if c.endswith("Peak area")]
+    area = fdf[area_cols[0]].fillna(0).astype(float).to_numpy() if area_cols else np.zeros(n)
+
+    NA = QualityCategory.NOT_APPLICABLE.value
+    DEC = QualityCategory.DECENT.value
+    df = pd.DataFrame({
+        "feature_id": fid.astype(np.int32),
+        "external_feature_id": np.full(n, -1, dtype=np.int32),
+        "compound_id": compound,
+        "mz_apex": mz.astype(np.float32),
+        "rt_apex_s": (rt_apex_min * 60.0).astype(np.float32),
+        "rt_start_s": (rt_lo * 60.0).astype(np.float32),
+        "rt_end_s": (rt_hi * 60.0).astype(np.float32),
+        "area": area.astype(np.float32),
+        "charge": charge.astype(np.int8),
+        "adduct_charge": (sign * charge).astype(np.int8),
+        "has_ms1": np.ones(n, dtype=bool),
+        "has_ms2": has_ms2,
+        # EB has no SIRIUS-style 0-4 grade; it already quality-filters (min scans,
+        # Gaussian sim >= 0.7, noise <= 2), so passed features are marked DECENT.
+        # Downstream (feature_detection.py) reads only `adduct`; the benchmark
+        # scores EB via its own path, not this HDF5.
+        "peak_quality": np.full(n, DEC, np.int8),
+        "alignment_quality": np.full(n, NA, np.int8),
+        "isotope_quality": np.full(n, NA, np.int8),
+        "ms2_quality": np.where(has_ms2, DEC, NA).astype(np.int8),
+        "adduct_quality": np.array([DEC if a else NA for a in adduct], dtype=np.int8),
+        "overall_quality": np.full(n, DEC, np.int8),
+        "adduct": [a[:32] for a in adduct],
+        "alternative_adducts": [""] * n,
+    })
+    # EB does not export a per-feature isotope m/z list here; the msbuddy MS1 path
+    # reads the raw MS1 window (feature_detection._ms1_window), not this group.
+    isotope_patterns: list = []
+    attrs["n_features_eb"] = n
     return df, isotope_patterns, attrs, {"ok": True, "skip_reason": ""}
 
 
