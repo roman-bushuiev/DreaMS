@@ -1456,10 +1456,16 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
 
     Linkage rule:
       precursor m/z within ``tol_mz_ppm`` of feature ``mz_apex`` AND
-      MS2 RT within ``[rt_apex - tol_rt_s, rt_apex + tol_rt_s]`` (if
-      ``rt_start``/``rt_end`` columns exist, those are used instead).
+      MS2 RT within the feature's RT range ``[rt_start, rt_end]`` (or
+      ``[rt_apex - tol_rt_s, rt_apex + tol_rt_s]`` without range columns),
+      widened by ``tol_rt_s`` on each side.
 
-    If multiple features match, the one with closest m/z (in ppm) wins.
+    Which feature wins when several match: a feature whose range contains the
+    MS2 RT always beats one reached only through the ``tol_rt_s`` margin; among
+    containing features the closest m/z wins; among margin-only features the
+    nearest range wins, then the closest m/z. (Closest m/z alone used to decide,
+    so an MS2 inside a large feature could go to a small neighbour a few seconds
+    away whose m/z was a fraction of a ppm closer.)
     """
     precursor_mz = np.asarray(precursor_mz, dtype=float)
     rt_seconds = np.asarray(rt_seconds, dtype=float)
@@ -1494,11 +1500,12 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
         if not np.isfinite(pmz) or not np.isfinite(prt):
             continue
         ppm = 1e6 * np.abs(mz - pmz) / np.maximum(pmz, 1e-9)
-        in_rt = (prt >= rt_lo - tol_rt_s) & (prt <= rt_hi + tol_rt_s)
-        ok = (ppm <= tol_mz_ppm) & in_rt
+        gap = np.maximum(rt_lo - prt, 0.0) + np.maximum(prt - rt_hi, 0.0)   # 0 inside the range
+        ok = (ppm <= tol_mz_ppm) & (gap <= tol_rt_s)
         if not ok.any():
             continue
-        best = np.where(ok, ppm, np.inf).argmin()
+        cand = np.flatnonzero(ok)
+        best = cand[np.lexsort((ppm[cand], gap[cand]))[0]]
         out[i] = int(fid[best])
     return out
 
