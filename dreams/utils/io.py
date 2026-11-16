@@ -989,10 +989,12 @@ def read_mzml(
                 with h5py.File(str(output_path), "r") as hf:
                     prec_mz = hf[PRECURSOR_MZ][:]
                     rt_s = hf[RT][:]
+                    positive = hf["positive polarity"][:] if "positive polarity" in hf else None
                 fids = link_ms2_to_features(
                     prec_mz, rt_s, feats_df,
                     tol_mz_ppm=resolved_tol_ppm,
                     tol_rt_s=sirius_tol_rt_s,
+                    positive=positive,
                 )
                 # Record feature-detection status in the group attrs so the
                 # HDF5 is self-describing (benchmark / validation read it back).

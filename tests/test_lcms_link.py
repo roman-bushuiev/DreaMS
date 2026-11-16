@@ -14,9 +14,27 @@ def test_a_feature_containing_the_scan_beats_a_closer_mz_reached_through_the_mar
     assert link_ms2_to_features(np.array([217.0863]), np.array([574.4]), feats, tol_mz_ppm=5, tol_rt_s=5).tolist() == [1]
 
 
-def test_inside_several_features_the_closest_mz_wins():
-    feats = _features([(0, 300.0010, 100, 200), (1, 300.0002, 150, 160)])
+def test_inside_several_features_the_nearest_apex_wins_then_the_closest_mz():
+    # two neighbouring chromatographic peaks of one m/z whose ranges overlap: the scan belongs to the peak it sits on,
+    # although the other feature's m/z is closer
+    feats = pd.DataFrame({"feature_id": [0, 1], "mz_apex": [300.0002, 300.0010], "rt_start_s": [100.0, 118.0],
+                          "rt_end_s": [125.0, 140.0], "rt_apex_s": [105.0, 124.0]})
+    got = link_ms2_to_features(np.array([300.0, 300.0]), np.array([123.0, 110.0]), feats, tol_mz_ppm=10, tol_rt_s=5)
+    assert got.tolist() == [1, 0]
+    # the same apex distance: the closest m/z
+    feats = _features([(0, 300.0010, 100, 200), (1, 300.0002, 100, 200)])
     assert link_ms2_to_features(np.array([300.0]), np.array([155.0]), feats, tol_mz_ppm=10, tol_rt_s=5).tolist() == [1]
+
+
+def test_a_scan_links_to_a_feature_of_its_own_polarity():
+    feats = _features([(0, 300.0000, 100, 200), (1, 300.0004, 100, 200)]).assign(polarity=[1, 0])
+    got = link_ms2_to_features(np.array([300.0, 300.0]), np.array([150.0, 150.0]), feats, tol_mz_ppm=10, tol_rt_s=5,
+                               positive=np.array([True, False]))
+    assert got.tolist() == [0, 1]
+    one = feats.iloc[:1]
+    got = link_ms2_to_features(np.array([300.0]), np.array([150.0]), one, tol_mz_ppm=10, tol_rt_s=5,
+                               positive=np.array([False]))
+    assert got.tolist() == [-1]
 
 
 def test_only_through_the_margin_the_nearest_range_wins_and_the_accepted_set_is_unchanged():

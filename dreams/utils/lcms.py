@@ -1451,7 +1451,8 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
                          rt_seconds: np.ndarray,
                          features_df: pd.DataFrame,
                          tol_mz_ppm: float = 10.0,
-                         tol_rt_s: float = 5.0) -> np.ndarray:
+                         tol_rt_s: float = 5.0,
+                         positive: Optional[np.ndarray] = None) -> np.ndarray:
     """For each MS2 spectrum row, return the parent feature_id (or -1).
 
     Linkage rule:
@@ -1462,10 +1463,15 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
 
     Which feature wins when several match: a feature whose range contains the
     MS2 RT always beats one reached only through the ``tol_rt_s`` margin; among
-    containing features the closest m/z wins; among margin-only features the
-    nearest range wins, then the closest m/z. (Closest m/z alone used to decide,
-    so an MS2 inside a large feature could go to a small neighbour a few seconds
-    away whose m/z was a fraction of a ppm closer.)
+    containing features the one whose apex is nearest in time wins (two features
+    of one m/z whose ranges overlap are neighbouring chromatographic peaks, and
+    the scan belongs to the peak it sits on), then the closest m/z; among
+    margin-only features the nearest range wins, then the closest m/z.
+
+    ``positive``: per MS2 row, whether the scan is positive mode. With it and a
+    ``polarity`` column in ``features_df`` (1 positive, 0 negative: a run that
+    holds scans of both polarities), a scan is linked only to a feature of its
+    own polarity.
     """
     precursor_mz = np.asarray(precursor_mz, dtype=float)
     rt_seconds = np.asarray(rt_seconds, dtype=float)
@@ -1494,6 +1500,9 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
         rt_hi = apex + tol_rt_s
 
     fid = features_df["feature_id"].to_numpy(dtype=np.int32)
+    apex = next((features_df[c].to_numpy(dtype=float) for c in ("rt_apex_s", "rt_apex") if c in cols),
+                (rt_lo + rt_hi) / 2.0)
+    f_pos = (features_df["polarity"].to_numpy() == 1) if (positive is not None and "polarity" in cols) else None
 
     for i in range(n):
         pmz, prt = precursor_mz[i], rt_seconds[i]
@@ -1502,10 +1511,13 @@ def link_ms2_to_features(precursor_mz: np.ndarray,
         ppm = 1e6 * np.abs(mz - pmz) / np.maximum(pmz, 1e-9)
         gap = np.maximum(rt_lo - prt, 0.0) + np.maximum(prt - rt_hi, 0.0)   # 0 inside the range
         ok = (ppm <= tol_mz_ppm) & (gap <= tol_rt_s)
+        if f_pos is not None:
+            ok &= f_pos == bool(positive[i])
         if not ok.any():
             continue
         cand = np.flatnonzero(ok)
-        best = cand[np.lexsort((ppm[cand], gap[cand]))[0]]
+        to_apex = np.where(gap[cand] == 0, np.abs(apex[cand] - prt), 0.0)
+        best = cand[np.lexsort((ppm[cand], to_apex, gap[cand]))[0]]
         out[i] = int(fid[best])
     return out
 
@@ -2077,6 +2089,12 @@ def attach_features_group(hdf5_pth,
                       "ms2_quality", "adduct_quality", "overall_quality"):
                 g.create_dataset(q, data=features_df[q].to_numpy(np.int8),
                                  compression="gzip", compression_opts=CL)
+            # optional columns, written when the detector provides them: the feature's polarity (a run with
+            # scans of both), and the ion identity network's evidence
+            for col, dtype in (("polarity", np.int8), ("adduct_support", np.int16)):
+                if col in features_df.columns:
+                    g.create_dataset(col, data=features_df[col].to_numpy(dtype),
+                                     compression="gzip", compression_opts=CL)
             for col, slen in (("adduct", 32), ("alternative_adducts", 64)):
                 g.create_dataset(
                     col,
@@ -2461,11 +2479,73 @@ def assign_adducts_by_network(features_df: pd.DataFrame, polarity: str,
     return features_df, partner_count
 
 
+def _polarity_code(spectrum) -> int:
+    """1 positive, 0 negative, -1 unknown."""
+    try:
+        p = spectrum.getInstrumentSettings().getPolarity()
+    except Exception:
+        return -1
+    return 1 if p == pyms.IonSource.Polarity.POSITIVE else 0 if p == pyms.IonSource.Polarity.NEGATIVE else -1
+
+
 def compute_features_via_openms(mzml_pth, work_dir=None,
                                 method: str = "openms_dreams",
                                 tol_mz_ppm: Optional[float] = None,
                                 noise_quantile: float = 0.05,
-                                adduct_min_shape_corr: float = 0.85):
+                                adduct_min_shape_corr: float = 0.85,
+                                min_trace_scans: int = 4):
+    """OpenMS feature detection of an mzML (see :func:`_features_via_openms_exp` for the method and the returned
+    4-tuple). The polarity is read from every spectrum. A run with scans of both polarities (polarity switching, or
+    a segment of the other polarity) is detected once per polarity, on that polarity's scans only: a positive and a
+    negative ion are different ions, and a mass trace must not alternate between them. The feature table then
+    holds both sets, told apart by its ``polarity`` column (1 positive, 0 negative), with ion identities and compound
+    ids assigned inside each polarity. Spectra without a polarity follow the run's only polarity; in a run with
+    both they are left out.
+    """
+    if method not in OPENMS_METHODS:
+        raise ValueError(f"Unknown OpenMS method {method!r}; expected one of {OPENMS_METHODS}")
+    exp = pyms.MSExperiment()
+    pyms.MzMLFile().load(str(mzml_pth), exp)
+    kw = dict(method=method, tol_mz_ppm=tol_mz_ppm, noise_quantile=noise_quantile,
+              adduct_min_shape_corr=adduct_min_shape_corr, min_trace_scans=min_trace_scans)
+    codes = np.array([_polarity_code(s) for s in exp], dtype=np.int8)
+    known = sorted(set(codes[codes >= 0].tolist()), reverse=True)
+    if len(known) < 2:
+        pol = known[0] if known else 1
+        df, iso, attrs, status = _features_via_openms_exp(mzml_pth, exp, polarity=pol, **kw)
+        if len(df):
+            df["polarity"] = np.int8(pol)
+        return df, iso, attrs, status
+    frames, patterns, attrs, status = [], [], None, None
+    for pol in known:
+        sub = pyms.MSExperiment(exp)
+        sub.setSpectra([s for s, c in zip(exp, codes) if c == pol])
+        df, iso, a, st = _features_via_openms_exp(mzml_pth, sub, polarity=pol, compound_prefix="CP" if pol else "CN", **kw)
+        if attrs is None or (st.get("ok") and not (status or {}).get("ok")):
+            attrs, status = dict(a), st
+        for k in ("noise_threshold_int", "min_trace_length_s"):
+            if k in a:
+                attrs[f"{k}_{'pos' if pol else 'neg'}"] = a[k]
+        if len(df):
+            df["polarity"] = np.int8(pol)
+            frames.append(df)
+            patterns.extend(iso)
+    attrs["polarity"] = "mixed"
+    if not frames:
+        return pd.DataFrame(), [], attrs, status
+    df = pd.concat(frames, ignore_index=True)
+    df["feature_id"] = np.arange(len(df), dtype=np.int32)
+    df["sirius_feature_id"] = [f"openms_{i}" for i in range(len(df))]
+    return df, patterns, attrs, {"ok": True, "skip_reason": ""}
+
+
+def _features_via_openms_exp(mzml_pth, exp, method: str = "openms_dreams",
+                             tol_mz_ppm: Optional[float] = None,
+                             noise_quantile: float = 0.05,
+                             adduct_min_shape_corr: float = 0.85,
+                             min_trace_scans: int = 4,
+                             polarity: int = 1,
+                             compound_prefix: str = "C"):
     """OpenMS feature detection returning the SIRIUS 4-tuple schema.
 
     ``method`` is one of :data:`OPENMS_METHODS`:
@@ -2481,17 +2561,11 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     Non-DDA-centroid and QQQ files are skipped with the same reasons as the
     SIRIUS path (benchmark parity).
     """
-    if method not in OPENMS_METHODS:
-        raise ValueError(f"Unknown OpenMS method {method!r}; expected one of {OPENMS_METHODS}")
     mzml_pth = Path(mzml_pth)
     is_enhanced = (method == "openms_dreams")
-
-    # Load the full experiment once up front. IIMN/msConvert mzMLs are often
-    # non-indexed (no <indexList>), which OnDiscMSExperiment cannot read, so we
-    # derive instrument name + acquisition mode from this in-memory experiment
-    # rather than from header-only OnDisc calls.
-    exp = pyms.MSExperiment()
-    pyms.MzMLFile().load(str(mzml_pth), exp)
+    # ``exp``: the run's spectra of one polarity (``polarity``: 1 positive, 0 negative), loaded in memory.
+    # IIMN/msConvert mzMLs are often non-indexed (no <indexList>), which OnDiscMSExperiment cannot read, so
+    # instrument name + acquisition mode come from this experiment rather than from header-only OnDisc calls.
 
     # --- Prelude: instrument classification + skip checks (no SIRIUS calls). ---
     instrument_name = get_instrument_name(mzml_pth, exp=exp)
@@ -2546,13 +2620,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     ms1 = pyms.MSExperiment()
     ms1_intensities = []
     ms2_prec_mz, ms2_prec_rt, ms2_intensities = [], [], []
-    polarity = None
     for s in exp:
-        if polarity is None:
-            try:
-                polarity = s.getInstrumentSettings().getPolarity()
-            except Exception:
-                polarity = None
         lvl = s.getMSLevel()
         if lvl == 1:
             ms1.addSpectrum(s)
@@ -2574,7 +2642,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
     ms1.updateRanges()
     if ms1.getNrSpectra() == 0:
         return pd.DataFrame(), [], attrs, {"ok": False, "skip_reason": "no_ms1_spectra"}
-    polarity_str = "neg" if polarity == 2 else "pos"
+    polarity_str = "pos" if polarity else "neg"
     attrs["polarity"] = polarity_str
 
     # --- Stage 1: mass-trace detection (data-driven noise for enhanced). ---
@@ -2587,8 +2655,18 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
         noise = estimate_noise_threshold_int(all_int, quantile=noise_quantile)
         p_mtd.setValue("noise_threshold_int", float(noise))
         p_mtd.setValue("mass_error_ppm", float(resolved_ppm))
+        # Shortest mass trace kept: ``min_trace_scans`` MS1 scans, at most OpenMS's default 5 s. A chromatographic
+        # peak needs a few points to be one, however fast the instrument scans: a fixed 5 s is 15 scans at three
+        # MS1 scans a second and dropped every peak shorter than that, however intense (16 to 19% of the MS/MS
+        # scans of fast-gradient runs had no feature).
+        rts = np.array([s.getRT() for s in ms1], dtype=float)
+        cycle = float(np.median(np.diff(rts))) if rts.size > 1 else 0.0
+        min_len = float(min(5.0, max(min_trace_scans * cycle, 0.5))) if cycle > 0 else 5.0
+        p_mtd.setValue("min_trace_length", min_len)
         attrs["noise_threshold_int"] = float(noise)
         attrs["mass_error_ppm"] = float(resolved_ppm)
+        attrs["ms1_cycle_s"] = cycle
+        attrs["min_trace_length_s"] = min_len
     mtd.setParameters(p_mtd)
     traces = []
     mtd.run(ms1, traces, 0)
@@ -2742,7 +2820,7 @@ def compute_features_via_openms(mzml_pth, work_dir=None,
         ad_q[has_ad & (partner_count == 1)] = QualityCategory.DECENT.value
         ad_q[has_ad & (partner_count >= 2)] = QualityCategory.GOOD.value
         df["adduct_quality"] = ad_q
-        df["compound_id"] = assign_compound_ids_by_adduct(df, mz_tol_ppm=resolved_ppm)
+        df["compound_id"] = assign_compound_ids_by_adduct(df, mz_tol_ppm=resolved_ppm, id_prefix=compound_prefix)
 
         # Overall quality. A DECENT+ feature needs a strong chromatographic peak
         # (peak GOOD, SNR >= 50) AND structural corroboration: a >=2-trace isotope
